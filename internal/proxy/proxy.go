@@ -2,12 +2,12 @@ package proxy
 
 import (
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"strings"
 )
-
-const TargetHeader = "X-Target-Service"
 
 type Resolver interface {
 	GetService(name string) (string, bool)
@@ -22,14 +22,31 @@ func New(routes Resolver, log *slog.Logger) *Handler {
 	return &Handler{routes: routes, log: log}
 }
 
+func serviceName(r *http.Request) string {
+	name := r.URL.Host
+	if name == "" {
+		name = r.Host
+	}
+	if host, _, err := net.SplitHostPort(name); err == nil {
+		name = host
+	}
+	return strings.ToLower(name)
+}
+
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	name := r.Header.Get(TargetHeader)
+	name := serviceName(r)
 	log := h.log.With("service", name, "method", r.Method, "path", r.URL.Path)
+
+	if name == "" {
+		log.Warn("request has no target service")
+		writeError(w, http.StatusBadRequest, "no_route", "no target service in request")
+		return
+	}
 
 	addr, ok := h.routes.GetService(name)
 	if !ok {
 		log.Warn("service not found")
-		writeError(w, http.StatusNotFound, "service_not_found", "service not found")
+		writeError(w, http.StatusNotFound, "no_route", "unknown service")
 		return
 	}
 
@@ -49,7 +66,6 @@ func (h *Handler) reverseProxy(target *url.URL, log *slog.Logger) *httputil.Reve
 		Rewrite: func(pr *httputil.ProxyRequest) {
 			pr.SetURL(target)
 			pr.SetXForwarded()
-			pr.Out.Header.Del(TargetHeader)
 		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 			log.Error("upstream failed", "err", err)
