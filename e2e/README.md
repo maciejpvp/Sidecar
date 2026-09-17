@@ -1,0 +1,90 @@
+# End-to-end example: service A → sidecar → service B
+
+Two toy services and a real sidecar, wired together so one request can be followed the whole way
+across. Same harness serves both entry points: a demo you watch, and a test suite that fails
+when routing or the error model breaks.
+
+Related: [../docs/DESIGN.md](../docs/DESIGN.md) · [../docs/TODO.md](../docs/TODO.md)
+
+---
+
+## Run it
+
+```bash
+go run ./e2e/demo          # one A→B round trip, printed step by step, exits non-zero if it fails
+go run ./e2e/demo -hold    # same, then stays up on 127.0.0.1:15001 so you can send your own
+go test ./e2e/ -race -v    # the automated version, on ephemeral ports
+```
+
+With `-hold` running:
+
+```bash
+curl -is -H 'Host: service-b' http://127.0.0.1:15001/v1/hello   # 200, echoed request
+curl -is -H 'Host: nope'      http://127.0.0.1:15001/v1/hello   # 404, X-Sidecar-Error: no_route
+```
+
+## What runs where
+
+```mermaid
+flowchart LR
+    A["service-a<br/>(the caller)"] -->|"GET /v1/hello<br/>Host: service-b"| S
+    subgraph Sidecar["Sidecar A"]
+        S["Outbound listener<br/>127.0.0.1:15001"] --> RT["Routing table<br/>service-b → 127.0.0.1:PORT"]
+    end
+    RT -->|"+ X-Forwarded-*"| B["service-b<br/>(echo, ephemeral port)"]
+    B -.->|"200, JSON describing<br/>what it received"| A
+```
+
+Everything runs in one process as goroutines, but each service is a real `net/http` server on a
+real loopback port, so the sidecar hop is a genuine TCP connection.
+
+Service B echoes back what it received — path, `Host`, `X-Forwarded-*` — which is what makes both
+the demo output and the test assertions mean something: they describe the far side of the hop,
+not what the caller sent.
+
+### The hop that is missing
+
+DESIGN §2 has every hop going sidecar → sidecar: A's outbound listener should be talking to B's
+*inbound* listener on `:15000`, which then forwards to B's app on `127.0.0.1:8080`. There is no
+inbound listener yet ([TODO.md](../docs/TODO.md) P1), so A's sidecar talks to B's app directly.
+When inbound lands, it slots in front of `StartEcho` in [harness.go](harness.go) and nothing in
+the tests needs to change.
+
+## What this covers
+
+| Test | What it pins down |
+|---|---|
+| `TestRequestFromAToB` | the round trip: B is reached by name, sees the right path, gets `X-Forwarded-For`. Runs per addressing form — `host header`, `proxy style` (absolute URI), and `path kept verbatim` |
+| `TestUnknownService` | 404 `no_route` with the §7 JSON body, and B is not called |
+| `TestUpstreamDown` | route exists, nothing listening → 502 `upstream_connect_failed` |
+| `TestRoundRobin` | two instances of one service split requests evenly |
+
+Not covered, because none of it exists yet: retries, deadlines, outlier ejection, retry budgets,
+inbound context stamping, hot reload. Those are P1 in [TODO.md](../docs/TODO.md), and this folder
+is where their end-to-end tests should go — `StartEcho` gains failure modes (slow, flaky, 503),
+`StartSidecar` gains per-service policy.
+
+## Addressing
+
+A service is named in the **`Host` header**:
+[`serviceName`](../internal/proxy/proxy.go#L25-L34) reads `r.URL.Host` (the absolute-URI form an
+HTTP proxy receives) and falls back to `r.Host`. Two ways to say the same thing:
+
+```bash
+curl -H 'Host: service-b' http://127.0.0.1:15001/v1/hello   # name it per request
+http_proxy=http://127.0.0.1:15001 curl http://service-b/v1/hello   # or configure the proxy once
+```
+
+There is no path prefix. The sidecar claims no part of the app's URL space, so paths, redirects
+and cookies pass through without rewriting — `curl .../service-b/v1/hello` is a *path* on
+whatever service the Host names, not a route to `service-b`.
+
+`Call()` in [harness.go](harness.go) is the only place this is written down, deliberately.
+
+## When you implement these, change this folder
+
+| TODO item | What changes here |
+|---|---|
+| Instances as `host:port` (P0) | `StartSidecar` routes currently take full URLs, because the proxy runs them through `url.Parse`. When the table stores `host:port` per [CONFIG.md](../docs/CONFIG.md), strip the scheme in the harness |
+| YAML config (P0) | the demo can then write a config file and exec the real binary instead of wiring `routing.NewTable` + `proxy.New` itself — a stronger end-to-end test, since it would cover startup too |
+| Inbound listener (P1) | put an inbound sidecar in front of `StartEcho` and assert `X-Request-Id` / deadline headers arrive at the app |
