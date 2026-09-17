@@ -5,16 +5,20 @@ import (
 	"log/slog"
 	"net/http"
 	"testing"
+	"time"
+
+	"sidecar/internal/routing"
 )
 
-// quietLogger keeps the sidecar's JSON logs out of test output. Swap the
-// writer for os.Stdout when a test is misbehaving and you want to watch it.
+func instances(urls ...string) routing.ServiceConfig {
+	return routing.ServiceConfig{Instances: urls}
+}
+
 func quietLogger() *slog.Logger {
 	return slog.New(slog.NewJSONHandler(io.Discard, nil))
 }
 
-// startSidecar starts an ephemeral-port sidecar and stops it when the test ends.
-func startSidecar(t *testing.T, routes map[string][]string) *Sidecar {
+func startSidecar(t *testing.T, routes map[string]routing.ServiceConfig) *Sidecar {
 	t.Helper()
 	s, err := StartSidecar("127.0.0.1:0", routes, quietLogger())
 	if err != nil {
@@ -24,7 +28,6 @@ func startSidecar(t *testing.T, routes map[string][]string) *Sidecar {
 	return s
 }
 
-// startEcho starts a toy service and stops it when the test ends.
 func startEcho(t *testing.T, name string) *Echo {
 	t.Helper()
 	e := StartEcho(name)
@@ -32,28 +35,22 @@ func startEcho(t *testing.T, name string) *Echo {
 	return e
 }
 
-// TestRequestFromAToB is the whole point of this package: app A calls service B
-// by name through its sidecar, and B receives the request unchanged.
+// App A calls service B by name; B receives the request unchanged.
 func TestRequestFromAToB(t *testing.T) {
 	tests := []struct {
 		name string
 		call func(sidecarAddr, service, path string) (*http.Response, error)
 		path string
 	}{
-		// The two forms serviceName accepts: a per-request Host header, and
-		// the absolute request URI a configured HTTP proxy receives.
 		{name: "host header", call: Call, path: "/v1/hello"},
 		{name: "proxy style", call: CallViaProxy, path: "/v1/hello"},
-		// Routing by Host means the sidecar owns no part of the app's URL
-		// space, so a path whose first segment is itself a service name is
-		// still just a path.
 		{name: "path kept verbatim", call: Call, path: "/service-b/v1/hello/"},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			b := startEcho(t, "service-b")
-			sc := startSidecar(t, map[string][]string{"service-b": {b.URL}})
+			sc := startSidecar(t, map[string]routing.ServiceConfig{"service-b": instances(b.URL)})
 
 			res, err := tc.call(sc.Addr, "service-b", tc.path)
 			if err != nil {
@@ -87,10 +84,9 @@ func TestRequestFromAToB(t *testing.T) {
 	}
 }
 
-// TestUnknownService covers the no_route arm of the error model (DESIGN §7).
 func TestUnknownService(t *testing.T) {
 	b := startEcho(t, "service-b")
-	sc := startSidecar(t, map[string][]string{"service-b": {b.URL}})
+	sc := startSidecar(t, map[string]routing.ServiceConfig{"service-b": instances(b.URL)})
 
 	res, err := Call(sc.Addr, "service-nope", "/v1/hello")
 	if err != nil {
@@ -116,14 +112,13 @@ func TestUnknownService(t *testing.T) {
 	}
 }
 
-// TestUpstreamDown covers the ReverseProxy ErrorHandler: the route exists but
-// nothing is listening on it.
+// The route exists, but nothing is listening on it.
 func TestUpstreamDown(t *testing.T) {
 	b := StartEcho("service-b")
 	addr := b.URL
 	b.Close() // the address is now dead, but still in the routing table
 
-	sc := startSidecar(t, map[string][]string{"service-b": {addr}})
+	sc := startSidecar(t, map[string]routing.ServiceConfig{"service-b": instances(addr)})
 
 	res, err := Call(sc.Addr, "service-b", "/v1/hello")
 	if err != nil {
@@ -138,12 +133,10 @@ func TestUpstreamDown(t *testing.T) {
 	}
 }
 
-// TestRoundRobin checks that two instances of one service each get half the
-// requests.
 func TestRoundRobin(t *testing.T) {
 	b1 := startEcho(t, "service-b#1")
 	b2 := startEcho(t, "service-b#2")
-	sc := startSidecar(t, map[string][]string{"service-b": {b1.URL, b2.URL}})
+	sc := startSidecar(t, map[string]routing.ServiceConfig{"service-b": instances(b1.URL, b2.URL)})
 
 	const calls = 4
 	for i := range calls {
@@ -159,5 +152,86 @@ func TestRoundRobin(t *testing.T) {
 
 	if b1.Requests() != calls/2 || b2.Requests() != calls/2 {
 		t.Errorf("requests split %d/%d, want %d/%d", b1.Requests(), b2.Requests(), calls/2, calls/2)
+	}
+}
+
+// The upstream takes far longer than the budget, so finishing quickly is itself
+// part of the assertion.
+func TestDeadlineExceeded(t *testing.T) {
+	const (
+		timeout = 50 * time.Millisecond
+		delay   = 2 * time.Second
+	)
+
+	b := StartSlowEcho("service-b", delay)
+	t.Cleanup(b.Close)
+	sc := startSidecar(t, map[string]routing.ServiceConfig{
+		"service-b": {Instances: []string{b.URL}, Timeout: timeout},
+	})
+
+	start := time.Now()
+	res, err := Call(sc.Addr, "service-b", "/v1/hello")
+	if err != nil {
+		t.Fatalf("call service-b: %v", err)
+	}
+	elapsed := time.Since(start)
+
+	if res.StatusCode != http.StatusGatewayTimeout {
+		t.Errorf("status = %d, want 504", res.StatusCode)
+	}
+	if code := res.Header.Get("X-Sidecar-Error"); code != "deadline_exceeded" {
+		t.Errorf("X-Sidecar-Error = %q, want deadline_exceeded", code)
+	}
+	if elapsed >= delay {
+		t.Errorf("took %v, i.e. the sidecar waited for the upstream instead of enforcing its %v budget", elapsed, timeout)
+	}
+
+	got, err := ReadSidecarError(res)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Code != "deadline_exceeded" {
+		t.Errorf("body code = %q, want deadline_exceeded", got.Code)
+	}
+}
+
+func TestSlowButWithinBudget(t *testing.T) {
+	b := StartSlowEcho("service-b", 50*time.Millisecond)
+	t.Cleanup(b.Close)
+	sc := startSidecar(t, map[string]routing.ServiceConfig{
+		"service-b": {Instances: []string{b.URL}, Timeout: 2 * time.Second},
+	})
+
+	res, err := Call(sc.Addr, "service-b", "/v1/hello")
+	if err != nil {
+		t.Fatalf("call service-b: %v", err)
+	}
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", res.StatusCode)
+	}
+
+	got, err := ReadReceived(res)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Service != "service-b" {
+		t.Errorf("reached service %q, want service-b", got.Service)
+	}
+}
+
+// "Nowhere to send it" is 503, not the 404 of "no such service".
+func TestNoInstances(t *testing.T) {
+	sc := startSidecar(t, map[string]routing.ServiceConfig{"service-b": instances()})
+
+	res, err := Call(sc.Addr, "service-b", "/v1/hello")
+	if err != nil {
+		t.Fatalf("call service-b: %v", err)
+	}
+
+	if res.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want 503", res.StatusCode)
+	}
+	if code := res.Header.Get("X-Sidecar-Error"); code != "no_healthy_upstream" {
+		t.Errorf("X-Sidecar-Error = %q, want no_healthy_upstream", code)
 	}
 }

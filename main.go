@@ -6,13 +6,14 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"time"
+
 	"sidecar/internal/logging"
 	"sidecar/internal/proxy"
 	"sidecar/internal/routing"
 )
 
-// Outbound listener: loopback only, so the sidecar can never be used as an
-// open proxy into the mesh (DESIGN §2.1).
+// Loopback only: on any other interface this is an open proxy into the mesh.
 const outboundAddr = "127.0.0.1:15001"
 
 func main() {
@@ -21,9 +22,12 @@ func main() {
 	logger := logging.New(&level)
 	slog.SetDefault(logger)
 
-	table := routing.NewTable(map[string][]string{
-		"service1": {"https://www.youtube.com/"},
-		"billing":  {"http://10.0.0.1:8080", "http://10.0.0.2:8080", "http://10.0.0.3:8080"},
+	table := routing.NewTable(map[string]routing.ServiceConfig{
+		"service1": {Instances: []string{"https://www.youtube.com/"}},
+		"billing": {
+			Instances: []string{"http://10.0.0.1:8080", "http://10.0.0.2:8080", "http://10.0.0.3:8080"},
+			Timeout:   2 * time.Second,
+		},
 	})
 
 	p := proxy.New(table, logger)
@@ -36,7 +40,12 @@ func main() {
 
 	slog.Info("ready", "dir", "outbound", "addr", ln.Addr().String())
 
-	srv := &http.Server{Handler: p}
+	// No ReadTimeout/WriteTimeout: they would cap the whole exchange, fighting
+	// the per-service deadline and cutting off streaming responses.
+	srv := &http.Server{
+		Handler:           p,
+		ReadHeaderTimeout: 10 * time.Second,
+	}
 	if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		slog.Error("outbound listener stopped", "addr", outboundAddr, "error", err)
 		os.Exit(1)

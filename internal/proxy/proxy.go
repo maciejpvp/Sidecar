@@ -1,16 +1,20 @@
 package proxy
 
 import (
+	"context"
+	"errors"
 	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
 	"strings"
+
+	"sidecar/internal/routing"
 )
 
 type Resolver interface {
-	GetService(name string) (string, bool)
+	GetService(name string) (*routing.Service, bool)
 }
 
 type Handler struct {
@@ -43,10 +47,17 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	addr, ok := h.routes.GetService(name)
+	svc, ok := h.routes.GetService(name)
 	if !ok {
 		log.Warn("service not found")
 		writeError(w, http.StatusNotFound, "no_route", "unknown service")
+		return
+	}
+
+	addr, ok := svc.Pick()
+	if !ok {
+		log.Warn("service has no instances")
+		writeError(w, http.StatusServiceUnavailable, "no_healthy_upstream", "no instances available")
 		return
 	}
 
@@ -57,8 +68,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Debug("forwarding request", "target", target.String())
-	h.reverseProxy(target, log).ServeHTTP(w, r)
+	// Covers the response body too, not just time to first byte.
+	ctx, cancel := context.WithTimeout(r.Context(), svc.Timeout)
+	defer cancel()
+
+	log.Debug("forwarding request", "target", target.String(), "timeout", svc.Timeout.String())
+	h.reverseProxy(target, log).ServeHTTP(w, r.WithContext(ctx))
 }
 
 func (h *Handler) reverseProxy(target *url.URL, log *slog.Logger) *httputil.ReverseProxy {
@@ -68,8 +83,17 @@ func (h *Handler) reverseProxy(target *url.URL, log *slog.Logger) *httputil.Reve
 			pr.SetXForwarded()
 		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
-			log.Error("upstream failed", "err", err)
-			writeError(w, http.StatusBadGateway, "upstream_connect_failed", "upstream unavailable")
+			switch {
+			case errors.Is(err, context.DeadlineExceeded):
+				log.Warn("deadline exceeded", "err", err)
+				writeError(w, http.StatusGatewayTimeout, "deadline_exceeded", "upstream did not respond in time")
+			case errors.Is(err, context.Canceled):
+				// Caller hung up; no one left to send a status to.
+				log.Debug("client cancelled", "err", err)
+			default:
+				log.Error("upstream failed", "err", err)
+				writeError(w, http.StatusBadGateway, "upstream_connect_failed", "upstream unavailable")
+			}
 		},
 	}
 }

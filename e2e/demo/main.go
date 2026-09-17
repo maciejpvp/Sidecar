@@ -1,6 +1,5 @@
-// Command demo runs a two-service example end to end: service B listens on its
-// own port, service A calls it by name through the sidecar, and the round trip
-// is printed alongside the sidecar's real JSON logs.
+// Command demo runs the two-service example end to end: service A calls B
+// through the sidecar, then calls a service too slow to answer in time.
 //
 //	go run ./e2e/demo
 //	go run ./e2e/demo -hold    # leave the sidecar up so you can curl it
@@ -13,12 +12,14 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"sidecar/e2e"
 	"sidecar/internal/logging"
+	"sidecar/internal/routing"
 )
 
-// The outbound listener's documented address (DESIGN §2.1): loopback only.
+// Loopback only (DESIGN §2.1).
 const outboundAddr = "127.0.0.1:15001"
 
 func main() {
@@ -37,27 +38,25 @@ func run(hold bool) error {
 	logger := logging.New(&level)
 	slog.SetDefault(logger)
 
-	// Service B: the callee. In a real deployment this is another host's app,
-	// reached through that host's inbound sidecar; there is no inbound
-	// listener yet, so A's sidecar talks to B directly.
 	serviceB := e2e.StartEcho("service-b")
 	defer serviceB.Close()
 	step(1, "service-b listening on %s", serviceB.URL)
 
-	// Service A's sidecar. Its routing table is what turns the name
-	// "service-b" into that address.
-	sidecar, err := e2e.StartSidecar(outboundAddr, map[string][]string{
-		"service-b": {serviceB.URL},
+	slowService := e2e.StartSlowEcho("slow-service", 10*time.Second)
+	defer slowService.Close()
+	step(2, "slow-service listening on %s, and always takes 10s to answer", slowService.URL)
+
+	sidecar, err := e2e.StartSidecar(outboundAddr, map[string]routing.ServiceConfig{
+		"service-b":    {Instances: []string{serviceB.URL}},
+		"slow-service": {Instances: []string{slowService.URL}, Timeout: 200 * time.Millisecond},
 	}, logger)
 	if err != nil {
 		return err
 	}
 	defer sidecar.Close()
-	step(2, "sidecar (outbound) listening on %s, routing service-b -> %s", sidecar.Addr, serviceB.URL)
+	step(3, "sidecar (outbound) listening on %s, routing service-b and slow-service", sidecar.Addr)
 
-	// Service A: the caller. It knows the name of the service it wants and the
-	// address of its own sidecar, and nothing about where service-b runs.
-	step(3, "service-a calls GET /v1/hello with Host: service-b")
+	step(4, "service-a calls GET /v1/hello with Host: service-b")
 	res, err := e2e.Call(sidecar.Addr, "service-b", "/v1/hello")
 	if err != nil {
 		return fmt.Errorf("service-a could not reach service-b: %w", err)
@@ -67,7 +66,7 @@ func run(hold bool) error {
 	if err != nil {
 		return err
 	}
-	step(4, "service-a got %s", res.Status)
+	step(5, "service-a got %s", res.Status)
 	fmt.Printf("    service-b received:  %s %s\n", got.Method, got.Path)
 	fmt.Printf("    upstream Host:       %s   (rewritten by the sidecar from %q)\n", got.Host, "service-b")
 	fmt.Printf("    X-Forwarded-For:     %s   (added by the sidecar)\n", got.XForwardedFor)
@@ -77,7 +76,27 @@ func run(hold bool) error {
 		return fmt.Errorf("round trip did not reach service-b: status %s, service %q", res.Status, got.Service)
 	}
 
-	fmt.Printf("\n  Same request by hand:\n    curl -is -H 'Host: service-b' http://%s/v1/hello\n", sidecar.Addr)
+	step(6, "service-a calls slow-service, whose timeout is 200ms")
+	start := time.Now()
+	res, err = e2e.Call(sidecar.Addr, "slow-service", "/v1/hello")
+	if err != nil {
+		return fmt.Errorf("service-a could not reach slow-service: %w", err)
+	}
+	slow, err := e2e.ReadSidecarError(res)
+	if err != nil {
+		return err
+	}
+	step(7, "service-a got %s after %v", res.Status, time.Since(start).Round(time.Millisecond))
+	fmt.Printf("    X-Sidecar-Error:     %s\n", res.Header.Get("X-Sidecar-Error"))
+	fmt.Printf("    body:                %s\n", slow.Message)
+	fmt.Printf("    (slow-service is still working on it; nobody is waiting)\n")
+
+	if res.StatusCode != 504 || slow.Code != "deadline_exceeded" {
+		return fmt.Errorf("slow-service should have timed out: status %s, code %q", res.Status, slow.Code)
+	}
+
+	fmt.Printf("\n  The same requests by hand:\n    curl -is -H 'Host: service-b' http://%s/v1/hello\n", sidecar.Addr)
+	fmt.Printf("  A service that answers too late (504 deadline_exceeded):\n    curl -is -H 'Host: slow-service' http://%s/v1/hello\n", sidecar.Addr)
 	fmt.Printf("  An unknown service (404 no_route):\n    curl -is -H 'Host: nope' http://%s/v1/hello\n\n", sidecar.Addr)
 
 	if hold {

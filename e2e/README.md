@@ -11,7 +11,7 @@ Related: [../docs/DESIGN.md](../docs/DESIGN.md) · [../docs/TODO.md](../docs/TOD
 ## Run it
 
 ```bash
-go run ./e2e/demo          # one A→B round trip, printed step by step, exits non-zero if it fails
+go run ./e2e/demo          # an A→B round trip and a timeout, step by step; exits non-zero if either misbehaves
 go run ./e2e/demo -hold    # same, then stays up on 127.0.0.1:15001 so you can send your own
 go test ./e2e/ -race -v    # the automated version, on ephemeral ports
 ```
@@ -19,8 +19,9 @@ go test ./e2e/ -race -v    # the automated version, on ephemeral ports
 With `-hold` running:
 
 ```bash
-curl -is -H 'Host: service-b' http://127.0.0.1:15001/v1/hello   # 200, echoed request
-curl -is -H 'Host: nope'      http://127.0.0.1:15001/v1/hello   # 404, X-Sidecar-Error: no_route
+curl -is -H 'Host: service-b'    http://127.0.0.1:15001/v1/hello   # 200, echoed request
+curl -is -H 'Host: slow-service' http://127.0.0.1:15001/v1/hello   # 504, deadline_exceeded after 200ms
+curl -is -H 'Host: nope'         http://127.0.0.1:15001/v1/hello   # 404, no_route
 ```
 
 ## What runs where
@@ -58,11 +59,15 @@ the tests needs to change.
 | `TestUnknownService` | 404 `no_route` with the §7 JSON body, and B is not called |
 | `TestUpstreamDown` | route exists, nothing listening → 502 `upstream_connect_failed` |
 | `TestRoundRobin` | two instances of one service split requests evenly |
+| `TestDeadlineExceeded` | an upstream slower than the service's timeout → 504 `deadline_exceeded`, *fast* |
+| `TestSlowButWithinBudget` | a slow upstream that still answers in time is not cut off |
+| `TestNoInstances` | a service with an empty instance list → 503 `no_healthy_upstream`, not 404 |
 
-Not covered, because none of it exists yet: retries, deadlines, outlier ejection, retry budgets,
-inbound context stamping, hot reload. Those are P1 in [TODO.md](../docs/TODO.md), and this folder
-is where their end-to-end tests should go — `StartEcho` gains failure modes (slow, flaky, 503),
-`StartSidecar` gains per-service policy.
+Not covered, because none of it exists yet: deadline propagation between hops, retries, outlier
+ejection, retry budgets, inbound context stamping, hot reload. Those are P1 in
+[TODO.md](../docs/TODO.md), and this folder is where their end-to-end tests should go —
+`StartSlowEcho` is the first of the failure modes `Echo` will grow (flaky, 503), and
+`routing.ServiceConfig` is where per-service policy will hang.
 
 ## Addressing
 

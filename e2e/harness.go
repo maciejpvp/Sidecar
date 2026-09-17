@@ -18,8 +18,7 @@ import (
 	"sidecar/internal/routing"
 )
 
-// Received is what an Echo reports about the request it got: the view from the
-// far side of the sidecar hop.
+// Received is the view from the far side of the sidecar hop.
 type Received struct {
 	Service         string `json:"service"`
 	Method          string `json:"method"`
@@ -39,11 +38,21 @@ type Echo struct {
 	srv      *httptest.Server
 }
 
-// StartEcho starts an echo service on its own loopback port.
-func StartEcho(name string) *Echo {
+func StartEcho(name string) *Echo { return newEcho(name, 0) }
+
+func StartSlowEcho(name string, delay time.Duration) *Echo { return newEcho(name, delay) }
+
+func newEcho(name string, delay time.Duration) *Echo {
 	e := &Echo{Name: name}
 	e.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		e.requests.Add(1)
+		if delay > 0 {
+			select {
+			case <-time.After(delay):
+			case <-r.Context().Done():
+				return
+			}
+		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(Received{
 			Service:         name,
@@ -59,24 +68,18 @@ func StartEcho(name string) *Echo {
 	return e
 }
 
-// Requests counts what this instance has served, for load-balancing assertions.
 func (e *Echo) Requests() uint64 { return e.requests.Load() }
 
-// Close stops the service; its URL then refuses connections, which is how tests
-// produce an unreachable upstream.
 func (e *Echo) Close() { e.srv.Close() }
 
-// Sidecar is a running outbound listener with its own routing table.
 type Sidecar struct {
 	Addr string
 
 	srv *http.Server
 }
 
-// StartSidecar serves the outbound proxy on addr; "127.0.0.1:0" picks a free
-// port. Routes map a service name to instance URLs — full URLs, because the
-// proxy parses them with url.Parse.
-func StartSidecar(addr string, routes map[string][]string, log *slog.Logger) (*Sidecar, error) {
+// Instances are full URLs, because the proxy parses them with url.Parse.
+func StartSidecar(addr string, routes map[string]routing.ServiceConfig, log *slog.Logger) (*Sidecar, error) {
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return nil, fmt.Errorf("bind outbound listener on %s: %w", addr, err)
@@ -90,16 +93,14 @@ func StartSidecar(addr string, routes map[string][]string, log *slog.Logger) (*S
 	return s, nil
 }
 
-// Close drains the listener.
 func (s *Sidecar) Close() {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	s.srv.Shutdown(ctx)
 }
 
-// Call makes the request an app would make: connect to the local sidecar, name
-// the service in Host. The path is the upstream's own — the sidecar claims no
-// part of it. CallViaProxy is the other addressing form.
+// Call is how an app addresses a service: connect to the local sidecar, name
+// the service in Host. The path stays the upstream's own.
 func Call(sidecarAddr, service, path string) (*http.Response, error) {
 	req, err := http.NewRequest(http.MethodGet, "http://"+sidecarAddr+path, nil)
 	if err != nil {
@@ -109,9 +110,8 @@ func Call(sidecarAddr, service, path string) (*http.Response, error) {
 	return http.DefaultClient.Do(req)
 }
 
-// CallViaProxy calls as Call does, but through a client using the sidecar as its
-// HTTP proxy: the name arrives in the request line (r.URL.Host), which is what
-// an app gets for free from http_proxy.
+// CallViaProxy is the same, addressed the way http_proxy does it: the name
+// arrives in the request line rather than the Host header.
 func CallViaProxy(sidecarAddr, service, path string) (*http.Response, error) {
 	sidecarURL, err := url.Parse("http://" + sidecarAddr)
 	if err != nil {
@@ -121,7 +121,6 @@ func CallViaProxy(sidecarAddr, service, path string) (*http.Response, error) {
 	return client.Get("http://" + service + path)
 }
 
-// ReadReceived decodes an Echo's reply and closes the body.
 func ReadReceived(res *http.Response) (Received, error) {
 	defer res.Body.Close()
 	var got Received
@@ -131,14 +130,12 @@ func ReadReceived(res *http.Response) (Received, error) {
 	return got, nil
 }
 
-// SidecarError is the body the sidecar returns for its own failures (DESIGN §7);
-// upstream responses never look like this.
+// SidecarError is the body for sidecar-generated failures (DESIGN §7).
 type SidecarError struct {
 	Code    string `json:"code"`
 	Message string `json:"message"`
 }
 
-// ReadSidecarError decodes a sidecar error body and closes it.
 func ReadSidecarError(res *http.Response) (SidecarError, error) {
 	defer res.Body.Close()
 	var got SidecarError
