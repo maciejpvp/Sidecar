@@ -85,9 +85,15 @@ func StartSidecar(addr string, routes map[string]routing.ServiceConfig, log *slo
 		return nil, fmt.Errorf("bind outbound listener on %s: %w", addr, err)
 	}
 
+	table, err := routing.NewTable(routes)
+	if err != nil {
+		ln.Close()
+		return nil, fmt.Errorf("build routing table: %w", err)
+	}
+
 	s := &Sidecar{
 		Addr: ln.Addr().String(),
-		srv:  &http.Server{Handler: proxy.New(routing.NewTable(routes), log)},
+		srv:  &http.Server{Handler: proxy.New(table, log)},
 	}
 	go s.srv.Serve(ln)
 	return s, nil

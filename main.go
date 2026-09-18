@@ -22,13 +22,17 @@ func main() {
 	logger := logging.New(&level)
 	slog.SetDefault(logger)
 
-	table := routing.NewTable(map[string]routing.ServiceConfig{
+	table, err := routing.NewTable(map[string]routing.ServiceConfig{
 		"service1": {Instances: []string{"https://www.youtube.com/"}},
 		"billing": {
 			Instances: []string{"http://10.0.0.1:8080", "http://10.0.0.2:8080", "http://10.0.0.3:8080"},
 			Timeout:   2 * time.Second,
 		},
 	})
+	if err != nil {
+		slog.Error("invalid routing table", "error", err)
+		os.Exit(1)
+	}
 
 	p := proxy.New(table, logger)
 
