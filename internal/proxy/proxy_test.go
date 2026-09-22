@@ -57,6 +57,9 @@ func newFlakyUpstream(t *testing.T, n int64) *upstream {
 	return u
 }
 
+// addr is host:port, the form a routing table stores an instance in.
+func (u *upstream) addr() string { return u.srv.Listener.Addr().String() }
+
 func (u *upstream) received() []string {
 	u.mu.Lock()
 	defer u.mu.Unlock()
@@ -72,7 +75,7 @@ func closedAddr(t *testing.T) string {
 	}
 	addr := ln.Addr().String()
 	ln.Close()
-	return "http://" + addr
+	return addr
 }
 
 func newSidecar(t *testing.T, cfg routing.ServiceConfig) *httptest.Server {
@@ -106,7 +109,7 @@ func TestRetriesOntoHealthyInstance(t *testing.T) {
 	good := newUpstream(t, http.StatusOK)
 
 	sidecar := newSidecar(t, routing.ServiceConfig{
-		Instances: []string{bad.srv.URL, good.srv.URL},
+		Instances: []string{bad.addr(), good.addr()},
 	})
 
 	res := call(t, sidecar, http.MethodGet, nil)
@@ -128,7 +131,7 @@ func TestGivesUpAfterMaxAttempts(t *testing.T) {
 	c := newUpstream(t, http.StatusServiceUnavailable)
 
 	sidecar := newSidecar(t, routing.ServiceConfig{
-		Instances:   []string{a.srv.URL, b.srv.URL, c.srv.URL},
+		Instances:   []string{a.addr(), b.addr(), c.addr()},
 		MaxAttempts: 3,
 	})
 
@@ -154,7 +157,7 @@ func TestLapsOverInstances(t *testing.T) {
 	b := newUpstream(t, http.StatusServiceUnavailable)
 
 	sidecar := newSidecar(t, routing.ServiceConfig{
-		Instances:   []string{a.srv.URL, b.srv.URL},
+		Instances:   []string{a.addr(), b.addr()},
 		MaxAttempts: 5,
 	})
 
@@ -176,7 +179,7 @@ func TestSingleInstanceStillRetries(t *testing.T) {
 	only := newUpstream(t, http.StatusServiceUnavailable)
 
 	sidecar := newSidecar(t, routing.ServiceConfig{
-		Instances:   []string{only.srv.URL},
+		Instances:   []string{only.addr()},
 		MaxAttempts: 3,
 	})
 
@@ -191,7 +194,7 @@ func TestSingleInstanceRecovers(t *testing.T) {
 	flaky := newFlakyUpstream(t, 1)
 
 	sidecar := newSidecar(t, routing.ServiceConfig{
-		Instances:   []string{flaky.srv.URL},
+		Instances:   []string{flaky.addr()},
 		MaxAttempts: 3,
 	})
 
@@ -222,7 +225,7 @@ func TestNonRetriableStatusesPassThrough(t *testing.T) {
 			second := newUpstream(t, http.StatusOK)
 
 			sidecar := newSidecar(t, routing.ServiceConfig{
-				Instances: []string{first.srv.URL, second.srv.URL},
+				Instances: []string{first.addr(), second.addr()},
 			})
 
 			res := call(t, sidecar, http.MethodGet, nil)
@@ -245,7 +248,7 @@ func TestDoesNotRetryPOST(t *testing.T) {
 	good := newUpstream(t, http.StatusOK)
 
 	sidecar := newSidecar(t, routing.ServiceConfig{
-		Instances: []string{bad.srv.URL, good.srv.URL},
+		Instances: []string{bad.addr(), good.addr()},
 	})
 
 	res := call(t, sidecar, http.MethodPost, strings.NewReader("charge the card"))
@@ -265,7 +268,7 @@ func TestReplaysBufferedBody(t *testing.T) {
 	good := newUpstream(t, http.StatusOK)
 
 	sidecar := newSidecar(t, routing.ServiceConfig{
-		Instances: []string{bad.srv.URL, good.srv.URL},
+		Instances: []string{bad.addr(), good.addr()},
 	})
 
 	res := call(t, sidecar, http.MethodPut, strings.NewReader(payload))
@@ -285,7 +288,7 @@ func TestDoesNotRetryUnbufferedBody(t *testing.T) {
 	good := newUpstream(t, http.StatusOK)
 
 	sidecar := newSidecar(t, routing.ServiceConfig{
-		Instances: []string{bad.srv.URL, good.srv.URL},
+		Instances: []string{bad.addr(), good.addr()},
 	})
 
 	// io.NopCloser hides the concrete type, so ContentLength stays unknown and
@@ -306,7 +309,7 @@ func TestRetriesDialFailureForAnyMethod(t *testing.T) {
 	good := newUpstream(t, http.StatusOK)
 
 	sidecar := newSidecar(t, routing.ServiceConfig{
-		Instances: []string{dead, good.srv.URL},
+		Instances: []string{dead, good.addr()},
 	})
 
 	res := call(t, sidecar, http.MethodPost, strings.NewReader("safe: never sent"))
@@ -336,16 +339,20 @@ func TestAllInstancesUnreachable(t *testing.T) {
 
 // Backoff must not push the request past its own deadline.
 func TestRetriesStopAtDeadline(t *testing.T) {
-	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		select {
-		case <-time.After(2 * time.Second):
-		case <-r.Context().Done():
-		}
-	}))
-	t.Cleanup(slow.Close)
+	// Two separate instances, because a pool may not list the same address twice.
+	newSlow := func() string {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			select {
+			case <-time.After(2 * time.Second):
+			case <-r.Context().Done():
+			}
+		}))
+		t.Cleanup(srv.Close)
+		return srv.Listener.Addr().String()
+	}
 
 	sidecar := newSidecar(t, routing.ServiceConfig{
-		Instances: []string{slow.URL, slow.URL},
+		Instances: []string{newSlow(), newSlow()},
 		Timeout:   150 * time.Millisecond,
 	})
 

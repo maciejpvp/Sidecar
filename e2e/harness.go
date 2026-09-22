@@ -32,19 +32,32 @@ type Received struct {
 // Echo is a toy service: it answers every request by describing it.
 type Echo struct {
 	Name string
-	URL  string
+	// Addr is host:port, the form a routing table stores an instance in.
+	Addr string
 
 	requests atomic.Uint64
 	srv      *httptest.Server
 }
 
-func StartEcho(name string) *Echo { return newEcho(name, 0) }
+func StartEcho(name string) *Echo { return newEcho(name, 0, nil) }
 
-func StartSlowEcho(name string, delay time.Duration) *Echo { return newEcho(name, delay) }
+func StartSlowEcho(name string, delay time.Duration) *Echo { return newEcho(name, delay, nil) }
 
-func newEcho(name string, delay time.Duration) *Echo {
+// StartEchoOn is StartEcho on a listener of the caller's choosing, so a test can
+// put an instance on IPv6. It returns nil when the host cannot bind there at
+// all, which is the caller's cue to skip.
+func StartEchoOn(name, network, bind string) *Echo {
+	ln, err := net.Listen(network, bind)
+	if err != nil {
+		return nil
+	}
+	return newEcho(name, 0, ln)
+}
+
+// A nil listener means "wherever httptest puts it", i.e. IPv4 loopback.
+func newEcho(name string, delay time.Duration, ln net.Listener) *Echo {
 	e := &Echo{Name: name}
-	e.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	e.srv = httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		e.requests.Add(1)
 		if delay > 0 {
 			select {
@@ -64,7 +77,12 @@ func newEcho(name string, delay time.Duration) *Echo {
 			XForwardedProto: r.Header.Get("X-Forwarded-Proto"),
 		})
 	}))
-	e.URL = e.srv.URL
+	if ln != nil {
+		e.srv.Listener.Close()
+		e.srv.Listener = ln
+	}
+	e.srv.Start()
+	e.Addr = e.srv.Listener.Addr().String()
 	return e
 }
 
@@ -78,7 +96,7 @@ type Sidecar struct {
 	srv *http.Server
 }
 
-// Instances are full URLs, because the proxy parses them with url.Parse.
+// Instances are host:port, the same form the config file uses.
 func StartSidecar(addr string, routes map[string]routing.ServiceConfig, log *slog.Logger) (*Sidecar, error) {
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {

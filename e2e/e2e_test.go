@@ -3,6 +3,7 @@ package e2e
 import (
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"testing"
 	"time"
@@ -50,7 +51,7 @@ func TestRequestFromAToB(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			b := startEcho(t, "service-b")
-			sc := startSidecar(t, map[string]routing.ServiceConfig{"service-b": instances(b.URL)})
+			sc := startSidecar(t, map[string]routing.ServiceConfig{"service-b": instances(b.Addr)})
 
 			res, err := tc.call(sc.Addr, "service-b", tc.path)
 			if err != nil {
@@ -84,9 +85,68 @@ func TestRequestFromAToB(t *testing.T) {
 	}
 }
 
+// An instance address is `host:port` with no scheme, but the host itself is
+// whatever the machine can reach: a DNS name or an IPv6 literal is not a lesser
+// form of an IPv4 address. Nothing in the sidecar resolves names itself — that
+// stays with the dialler — so this is really a test that it does not interfere.
+func TestInstanceAddressFamilies(t *testing.T) {
+	tests := []struct {
+		name    string
+		network string
+		bind    string
+	}{
+		{name: "ipv4", network: "tcp4", bind: "127.0.0.1:0"},
+		{name: "ipv6", network: "tcp6", bind: "[::1]:0"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			b := StartEchoOn("service-b", tc.network, tc.bind)
+			if b == nil {
+				t.Skipf("this host cannot listen on %s", tc.bind)
+			}
+			t.Cleanup(b.Close)
+
+			_, port, err := net.SplitHostPort(b.Addr)
+			if err != nil {
+				t.Fatalf("split %q: %v", b.Addr, err)
+			}
+
+			// The literal the listener reported, and a DNS name for the same
+			// port — "localhost" resolves to both families.
+			for _, instance := range []string{b.Addr, "localhost:" + port} {
+				t.Run(instance, func(t *testing.T) {
+					sc := startSidecar(t, map[string]routing.ServiceConfig{
+						"service-b": instances(instance),
+					})
+
+					res, err := Call(sc.Addr, "service-b", "/v1/hello")
+					if err != nil {
+						t.Fatalf("call service-b at %s: %v", instance, err)
+					}
+					if res.StatusCode != http.StatusOK {
+						t.Fatalf("status = %d, want 200", res.StatusCode)
+					}
+					if code := res.Header.Get("X-Sidecar-Error"); code != "" {
+						t.Errorf("X-Sidecar-Error = %q, want empty", code)
+					}
+
+					got, err := ReadReceived(res)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if got.Service != "service-b" {
+						t.Errorf("reached service %q, want service-b", got.Service)
+					}
+				})
+			}
+		})
+	}
+}
+
 func TestUnknownService(t *testing.T) {
 	b := startEcho(t, "service-b")
-	sc := startSidecar(t, map[string]routing.ServiceConfig{"service-b": instances(b.URL)})
+	sc := startSidecar(t, map[string]routing.ServiceConfig{"service-b": instances(b.Addr)})
 
 	res, err := Call(sc.Addr, "service-nope", "/v1/hello")
 	if err != nil {
@@ -115,7 +175,7 @@ func TestUnknownService(t *testing.T) {
 // The route exists, but nothing is listening on it.
 func TestUpstreamDown(t *testing.T) {
 	b := StartEcho("service-b")
-	addr := b.URL
+	addr := b.Addr
 	b.Close() // the address is now dead, but still in the routing table
 
 	sc := startSidecar(t, map[string]routing.ServiceConfig{"service-b": instances(addr)})
@@ -136,7 +196,7 @@ func TestUpstreamDown(t *testing.T) {
 func TestRoundRobin(t *testing.T) {
 	b1 := startEcho(t, "service-b#1")
 	b2 := startEcho(t, "service-b#2")
-	sc := startSidecar(t, map[string]routing.ServiceConfig{"service-b": instances(b1.URL, b2.URL)})
+	sc := startSidecar(t, map[string]routing.ServiceConfig{"service-b": instances(b1.Addr, b2.Addr)})
 
 	const calls = 4
 	for i := range calls {
@@ -166,7 +226,7 @@ func TestDeadlineExceeded(t *testing.T) {
 	b := StartSlowEcho("service-b", delay)
 	t.Cleanup(b.Close)
 	sc := startSidecar(t, map[string]routing.ServiceConfig{
-		"service-b": {Instances: []string{b.URL}, Timeout: timeout},
+		"service-b": {Instances: []string{b.Addr}, Timeout: timeout},
 	})
 
 	start := time.Now()
@@ -199,7 +259,7 @@ func TestSlowButWithinBudget(t *testing.T) {
 	b := StartSlowEcho("service-b", 50*time.Millisecond)
 	t.Cleanup(b.Close)
 	sc := startSidecar(t, map[string]routing.ServiceConfig{
-		"service-b": {Instances: []string{b.URL}, Timeout: 2 * time.Second},
+		"service-b": {Instances: []string{b.Addr}, Timeout: 2 * time.Second},
 	})
 
 	res, err := Call(sc.Addr, "service-b", "/v1/hello")

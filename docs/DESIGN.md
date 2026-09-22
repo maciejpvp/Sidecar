@@ -11,8 +11,9 @@ Related: [CONFIG.md](CONFIG.md) (configuration reference) · [QUESTIONS.md](QUES
 The sidecar is a small process that runs next to every service instance and handles
 **service-to-service HTTP communication** on the app's behalf:
 
-- **Outbound**: the app calls `http://127.0.0.1:15001/<service>/<path>`; the sidecar resolves
-  `<service>` to a set of instances, load-balances, enforces deadlines, retries safely and
+- **Outbound**: the app sends its request to `127.0.0.1:15001` naming the target service in the
+  `Host` header (or as an absolute URI, the way any HTTP proxy is addressed); the sidecar resolves
+  that name to a set of instances, load-balances, enforces deadlines, retries safely and
   ejects unhealthy instances.
 - **Inbound (minimal pass-through)**: other services reach this app through the sidecar's
   public port `:15000`; the sidecar stamps request context (request id, trace, deadline),
@@ -22,7 +23,7 @@ The sidecar is a small process that runs next to every service instance and hand
 
 | # | Goal |
 |---|------|
-| G1 | Explicit HTTP/1.1 proxy with path-prefix addressing |
+| G1 | Explicit HTTP/1.1 proxy, services addressed by `Host` (see [QUESTIONS.md](QUESTIONS.md) D1) |
 | G2 | Static YAML service discovery with safe hot reload |
 | G3 | Round-robin load balancing over healthy instances |
 | G4 | Per-instance outlier ejection |
@@ -64,7 +65,7 @@ flowchart LR
 
     Caller["Other service's sidecar"] -->|HTTP| IN
     IN -->|stamp ctx| AppA
-    AppA -->|"GET /orders-svc/v1/..."| OUT
+    AppA -->|"GET /v1/...<br/>Host: orders-svc"| OUT
     OUT --> RT --> RES --> LB --> TR
     TR -->|HTTP| B1["orders-svc #1<br/>sidecar :15000"]
     TR -->|HTTP| B2["orders-svc #2<br/>sidecar :15000"]
@@ -101,8 +102,8 @@ sequenceDiagram
     participant U1 as orders-svc #1
     participant U2 as orders-svc #2
 
-    App->>S: GET /orders-svc/v1/orders/42<br/>X-Sidecar-Deadline, X-Request-Id, traceparent
-    S->>S: 1. parse prefix → service "orders-svc", path "/v1/orders/42"
+    App->>S: GET /v1/orders/42<br/>Host: orders-svc<br/>X-Sidecar-Deadline, X-Request-Id, traceparent
+    S->>S: 1. read Host → service "orders-svc"; path stays "/v1/orders/42"
     S->>S: 2. lookup service in routing table (else 404 no_route)
     S->>S: 3. compute deadline (header vs route timeout)
     S->>S: 4. pick healthy instance (round-robin)
@@ -119,9 +120,16 @@ sequenceDiagram
 
 Steps in detail:
 
-1. **Parse prefix.** First path segment = service name. `/orders-svc/v1/orders/42?x=1` →
-   service `orders-svc`, upstream path `/v1/orders/42?x=1`. Empty or unknown segment →
-   `404 no_route`.
+1. **Read the service name** from the request: `URL.Host` if the app sent an absolute URI (the
+   form an HTTP proxy receives, i.e. what `http_proxy=` produces), else the `Host` header. The
+   port, if any, is dropped and the name is lower-cased. The path and query are **never**
+   touched. Missing name → `400`; unknown name → `404 no_route`.
+
+   > **Why `Host` and not a `/<service>/` path prefix** (decision D1 in [QUESTIONS.md](QUESTIONS.md)):
+   > the sidecar claims no part of the app's URL space, so paths, redirects and cookies need no
+   > rewriting, and an app can reach the mesh with `HTTP_PROXY=127.0.0.1:15001` and an unmodified
+   > HTTP client. It also matches how a service is named in DNS, so the app's code reads
+   > `http://orders-svc/v1/orders/42` either way.
 2. **Route lookup** in the current immutable `*RoutingTable` (loaded once per request from an
    `atomic.Pointer`; the request uses that snapshot for its whole life).
 3. **Deadline** — see §5.3.
@@ -171,8 +179,15 @@ cooperation from every app:
 If the app does not forward them, things still work: the outbound sidecar starts a new
 request id / trace and uses the route timeout. You only lose correlation and deadline shrinking.
 
-Apps **address** services as `http://127.0.0.1:15001/<service>/<path>` and **must not** follow
-upstream redirects blindly (see §10, `Location` rewriting).
+Apps **address** services by name, either per request or once via the proxy environment:
+
+```bash
+curl -H 'Host: orders-svc' http://127.0.0.1:15001/v1/orders/42   # name it per request
+HTTP_PROXY=http://127.0.0.1:15001 curl http://orders-svc/v1/orders/42   # or configure it once
+```
+
+The path is the upstream's own, so `/orders-svc/...` is a *path on some service*, not a route to
+`orders-svc`. Apps **must not** follow upstream redirects blindly (see §10, `Location` rewriting).
 
 ---
 
@@ -332,6 +347,10 @@ type Service struct {
 }
 
 type Instance struct {
+    // Addr is bare host:port, exactly as configured: no scheme, because v1
+    // dials plain HTTP and TLS belongs to Transport, not to per-instance
+    // config (decision D2 in QUESTIONS.md). One canonical string means the
+    // config file, the access log and the outlier key never disagree.
     Addr    string            // "10.0.0.7:15000"
     Outlier *OutlierState     // carried over across reloads (see §8)
 }
@@ -403,7 +422,7 @@ X-Request-Id: 7f3a...
 
 | Code | Status | When |
 |---|---|---|
-| `no_route` | 404 | unknown/empty service prefix |
+| `no_route` | 404 | `Host` names no service in the table (empty `Host` → `400`) |
 | `no_healthy_upstream` | 503 | balancer returned nil |
 | `upstream_connect_failed` | 502 | last attempt couldn't connect, no response to return |
 | `deadline_exceeded` | 504 | deadline passed before or during attempts |
@@ -448,7 +467,8 @@ Config file format: see [CONFIG.md](CONFIG.md).
 ## 10. Known limitations / later work
 
 - **Redirects**: upstream `Location: http://10.0.0.7:15000/v1/x` leaks instance addresses and bypasses
-  the sidecar. v1 passes it through unchanged; later rewrite to `/<service>/v1/x`.
+  the sidecar. v1 passes it through unchanged; later rewrite the authority back to the service name
+  (`http://orders-svc/v1/x`), which under Host addressing (§3.1) leaves the path alone.
 - **Streaming**: large/chunked bodies are not retried; response streaming (SSE) works but a per-attempt
   timeout only covers time to first byte headers, not the whole body.
 - **No active health checks**, no half-open probing, no slow-start after un-ejection.
@@ -475,7 +495,7 @@ Event logs: `config_loaded`, `config_rejected`, `instance_ejected`, `instance_re
 
 | M | Deliverable | Done when |
 |---|---|---|
-| M1 | `cmd/sidecar`, outbound HTTP proxy, path-prefix routing, single instance per service, static config at startup, error model | `curl 127.0.0.1:15001/echo/hello` reaches an echo server; unknown service → 404 `no_route` |
+| M1 | `cmd/sidecar`, outbound HTTP proxy, `Host` routing, single instance per service, static config at startup, error model | `curl -H 'Host: echo' 127.0.0.1:15001/hello` reaches an echo server; unknown name → 404 `no_route` |
 | M2 | Config validation, defaults, mtime hot reload with atomic swap | editing YAML changes routing without restart; broken YAML is rejected and logged |
 | M3 | Multiple instances, round-robin, outlier ejection with max %, state carry-over | killing one of 3 echo servers → it gets ejected after 5 failures, traffic continues |
 | M4 | Deadlines (both headers), retries with eligibility rules, body buffering, budget, backoff | table-driven tests with fake clock + `httptest` servers cover every row of §5.1/§5.2 |

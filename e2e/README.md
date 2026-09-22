@@ -4,7 +4,7 @@ Two toy services and a real sidecar, wired together so one request can be follow
 across. Same harness serves both entry points: a demo you watch, and a test suite that fails
 when routing or the error model breaks.
 
-Related: [../docs/DESIGN.md](../docs/DESIGN.md) · [../docs/TODO.md](../docs/TODO.md)
+Related: [../docs/DESIGN.md](../docs/DESIGN.md) · [../docs/TODO.md](../docs/TODO.md) · [../docs/QUESTIONS.md](../docs/QUESTIONS.md)
 
 ---
 
@@ -71,8 +71,8 @@ ejection, retry budgets, inbound context stamping, hot reload. Those are P1 in
 
 ## Addressing
 
-A service is named in the **`Host` header**:
-[`serviceName`](../internal/proxy/proxy.go#L25-L34) reads `r.URL.Host` (the absolute-URI form an
+A service is named in the **`Host` header** (decision D1 in [../docs/QUESTIONS.md](../docs/QUESTIONS.md)):
+[`serviceName`](../internal/proxy/proxy.go#L41-L50) reads `r.URL.Host` (the absolute-URI form an
 HTTP proxy receives) and falls back to `r.Host`. Two ways to say the same thing:
 
 ```bash
@@ -90,6 +90,5 @@ whatever service the Host names, not a route to `service-b`.
 
 | TODO item | What changes here |
 |---|---|
-| Instances as `host:port` (P0) | `StartSidecar` routes currently take full URLs, because the proxy runs them through `url.Parse`. When the table stores `host:port` per [CONFIG.md](../docs/CONFIG.md), strip the scheme in the harness |
 | YAML config (P0) | the demo can then write a config file and exec the real binary instead of wiring `routing.NewTable` + `proxy.New` itself — a stronger end-to-end test, since it would cover startup too |
 | Inbound listener (P1) | put an inbound sidecar in front of `StartEcho` and assert `X-Request-Id` / deadline headers arrive at the app |

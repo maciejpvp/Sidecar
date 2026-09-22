@@ -23,11 +23,11 @@ func main() {
 	slog.SetDefault(logger)
 
 	table, err := routing.NewTable(map[string]routing.ServiceConfig{
-		"service1": {Instances: []string{"https://www.youtube.com/"}},
 		"billing": {
-			Instances: []string{"http://10.0.0.1:8080", "http://10.0.0.2:8080", "http://10.0.0.3:8080"},
+			Instances: []string{"10.0.0.1:15000", "10.0.0.2:15000", "10.0.0.3:15000"},
 			Timeout:   2 * time.Second,
 		},
+		"inventory": {Instances: []string{"10.0.1.7:15000"}},
 	})
 	if err != nil {
 		slog.Error("invalid routing table", "error", err)

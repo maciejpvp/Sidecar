@@ -40,15 +40,15 @@ func run(hold bool) error {
 
 	serviceB := e2e.StartEcho("service-b")
 	defer serviceB.Close()
-	step(1, "service-b listening on %s", serviceB.URL)
+	step(1, "service-b listening on %s", serviceB.Addr)
 
 	slowService := e2e.StartSlowEcho("slow-service", 10*time.Second)
 	defer slowService.Close()
-	step(2, "slow-service listening on %s, and always takes 10s to answer", slowService.URL)
+	step(2, "slow-service listening on %s, and always takes 10s to answer", slowService.Addr)
 
 	sidecar, err := e2e.StartSidecar(outboundAddr, map[string]routing.ServiceConfig{
-		"service-b":    {Instances: []string{serviceB.URL}},
-		"slow-service": {Instances: []string{slowService.URL}, Timeout: 200 * time.Millisecond},
+		"service-b":    {Instances: []string{serviceB.Addr}},
+		"slow-service": {Instances: []string{slowService.Addr}, Timeout: 200 * time.Millisecond},
 	}, logger)
 	if err != nil {
 		return err

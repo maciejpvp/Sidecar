@@ -1,28 +1,32 @@
 # Sidecar — TODO
 
 Ordered by importance: each tier unblocks the next. Within a tier, top items first.
-Design rationale for every item lives in [DESIGN.md](DESIGN.md) (section refs below).
+Design rationale for every item lives in [DESIGN.md](DESIGN.md) (section refs below); decisions
+already settled are in [QUESTIONS.md](QUESTIONS.md).
 
-Current state (spike): outbound-only proxy, routing by `X-Target-Service` header, hardcoded
-service table, round-robin over all endpoints, JSON error model, JSON logger.
+Current state: outbound-only proxy on `127.0.0.1:15001`, services addressed by `Host`
+(QUESTIONS D1), hardcoded service table of `host:port` instances (QUESTIONS D2), round-robin with
+retries on a fresh instance, per-service request deadline, JSON error model, JSON logger.
+End-to-end demo and tests in [../e2e](../e2e). No config file, no inbound listener, no access log.
 
 ---
 
 ## P0 — Foundation (nothing else is buildable or testable without these)
 
-- [ ] **Fix what's already wrong**
-  - `main.go` listens on `:8080` — that's the *app's* port per DESIGN §2.1. Outbound belongs on
-    `127.0.0.1:15001`, and it must bind loopback only or the sidecar is an open proxy into the mesh.
-  - `http.ListenAndServe` error is discarded — a failed bind currently exits 0 silently.
-  - Instances are full URLs (`https://www.youtube.com/`); CONFIG.md specifies `host:port`.
-    Pick one now, because routing, outlier keys (`service|addr`) and logs all embed this format.
-  - *Done when:* sidecar binds the documented ports and exits non-zero with a log line on bind failure.
+- [x] **Fix what's already wrong**
+  - Outbound now binds `127.0.0.1:15001` (loopback only, or the sidecar is an open proxy into the
+    mesh) and exits non-zero with a log line when the bind fails.
+  - Instance addresses are `host:port`, parsed with `net.SplitHostPort` and rejected with a precise
+    error otherwise — the form CONFIG.md specifies, and the one outlier keys (`service|addr`) and
+    the access log will embed. Rationale: QUESTIONS D2. Duplicates within a pool are rejected too.
+  - Still hardcoded in `main.go` until the config item below lands.
 
-- [ ] **Decide the addressing model: path prefix vs header** — DESIGN §3.1 says
-  `/{service}/{path}`, the code says `X-Target-Service`. This is the app-facing contract; every
-  later feature (routing, logs, redirect rewriting) assumes one. Path-prefix is the design choice
-  and matches how Envoy-style meshes are addressed.
-  *Done when:* `curl 127.0.0.1:15001/echo/hello` reaches an echo server, unknown prefix → 404 `no_route`.
+- [x] **Addressing model decided: `Host` header** (QUESTIONS D1) — not the path prefix the first
+  draft assumed. The sidecar claims no part of the app's URL space, so paths and redirects pass
+  through unrewritten, and `HTTP_PROXY=127.0.0.1:15001` works with an unmodified HTTP client.
+  DESIGN §1, §3.1, §4, §7, §10 and §12 M1 now describe this.
+  *Done:* `curl -H 'Host: echo' 127.0.0.1:15001/hello` reaches an echo server, unknown name → 404
+  `no_route`; both addressing forms are covered in `e2e.TestRequestFromAToB`.
 
 - [ ] **YAML config: parse → defaults → validate** (CONFIG.md, DESIGN §8) — the hardcoded map
   blocks literally every feature below, since retries, timeouts and ejection are all per-service
@@ -33,10 +37,11 @@ service table, round-robin over all endpoints, JSON error model, JSON logger.
   `-config` flag, signal handling, `http.Server.Shutdown` with a drain timeout.
   *Done when:* Ctrl+C drains in-flight requests instead of cutting them.
 
-- [ ] **Per-request timeout** — the single biggest correctness gap right now: a hung upstream
-  hangs the caller forever. Start with the simple form (`service.timeout` → `context.WithDeadline`
-  → 504 `deadline_exceeded`); full two-header propagation comes in P1.
-  *Done when:* a deliberately slow upstream returns 504 at the configured budget.
+- [x] **Per-request timeout** — `service.timeout` → `context.WithTimeout` → 504
+  `deadline_exceeded`, covering the response body as well as time to first byte. Full two-header
+  propagation is still P1, and `perTryTimeout` is still unimplemented (QUESTIONS Q2 — which is why
+  a *hanging* upstream gets one attempt and no retry).
+  *Done:* `e2e.TestDeadlineExceeded` and `proxy.TestRetriesStopAtDeadline`.
 
 - [ ] **Access log, one line per request** (DESIGN §11) — you cannot debug retries or ejection
   by reading code. Build this *before* the resilience work, not after.
@@ -50,10 +55,12 @@ service table, round-robin over all endpoints, JSON error model, JSON logger.
   backoff, budget windows and ejection timers are all time-driven. Without a fake clock you're
   testing with `time.Sleep`, which is slow and flaky. This item pays for itself immediately.
 
-- [ ] **Attempt classification + retries** (DESIGN §5.1, §5.2) — the heart of the project.
-  Eligibility rules (idempotent methods, `Idempotency-Key`, replayable body, time remaining),
-  full-jitter backoff select-ed against the request context.
-  *Done when:* table-driven tests cover every row of §5.1.
+- [~] **Attempt classification + retries** (DESIGN §5.1, §5.2) — landed ahead of the items above:
+  classification, retry onto a fresh instance, full-jitter backoff select-ed against the request
+  context, body buffering and replay, laps so a single-instance service still retries.
+  Still missing: `Idempotency-Key` for POST/PATCH (§5.2.1 rule 2), the retry budget (below), and
+  the per-attempt timeout that makes §5.1's timeout row reachable at all (QUESTIONS Q2).
+  *Done when:* table-driven tests cover every row of §5.1 — currently every row except that one.
 
 - [ ] **Outlier ejection + healthy-only balancing** (DESIGN §5.4, §5.5) — today the balancer
   cheerfully round-robins into a dead instance forever. Needs `maxEjectionPercent` so you never
