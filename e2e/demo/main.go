@@ -15,8 +15,8 @@ import (
 	"time"
 
 	"sidecar/e2e"
+	"sidecar/internal/config"
 	"sidecar/internal/logging"
-	"sidecar/internal/routing"
 )
 
 // Loopback only (DESIGN §2.1).
@@ -46,9 +46,12 @@ func run(hold bool) error {
 	defer slowService.Close()
 	step(2, "slow-service listening on %s, and always takes 10s to answer", slowService.Addr)
 
-	sidecar, err := e2e.StartSidecar(outboundAddr, map[string]routing.ServiceConfig{
-		"service-b":    {Instances: []string{serviceB.Addr}},
-		"slow-service": {Instances: []string{slowService.Addr}, Timeout: 200 * time.Millisecond},
+	slowRoute := config.NewService("slow-service", slowService.Addr)
+	slowRoute.Timeout = 200 * time.Millisecond
+
+	sidecar, err := e2e.StartSidecar(outboundAddr, []config.Service{
+		config.NewService("service-b", serviceB.Addr),
+		slowRoute,
 	}, logger)
 	if err != nil {
 		return err

@@ -67,7 +67,7 @@ Not covered, because none of it exists yet: deadline propagation between hops, r
 ejection, retry budgets, inbound context stamping, hot reload. Those are P1 in
 [TODO.md](../docs/TODO.md), and this folder is where their end-to-end tests should go —
 `StartSlowEcho` is the first of the failure modes `Echo` will grow (flaky, 503), and
-`routing.ServiceConfig` is where per-service policy will hang.
+`config.Service` (built with `config.NewService`) is where per-service policy hangs.
 
 ## Addressing
 

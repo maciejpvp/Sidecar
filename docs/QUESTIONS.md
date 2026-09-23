@@ -43,10 +43,11 @@ without being taught about the header first.
 
 ### D2 — Instance addresses are bare `host:port`, with no scheme
 
-*Status: decided · affects CONFIG.md §services + §Validation 4, DESIGN §6.1, §11 · code: `internal/routing.parseInstance`*
+*Status: decided · affects CONFIG.md §services + §Validation 4, DESIGN §6.1, §11 · code: `internal/config.instanceAddr`*
 
 The spike accepted full URLs (`http://10.0.0.7:15000`) because it handed them straight to
-`url.Parse`. The configured form is now `host:port`, and `routing` builds the `http` URL itself.
+`url.Parse`. The configured form is now `host:port`: `config` validates it, and `routing` builds
+the `http` URL from it without checking again.
 
 **Why:**
 
@@ -68,7 +69,7 @@ dot, any case, punycode), an IPv4 literal, or a bracketed IPv6 literal, because 
 wherever the operator runs them. The sidecar never resolves a name itself — that stays with the
 dialler, so an instance whose DNS record moves is followed without a config reload.
 `e2e.TestInstanceAddressFamilies` proves a request reaches an instance named by IPv6 literal and by
-DNS name; `routing.TestInstanceAddressForm` pins the accepted forms.
+DNS name; `config.TestInstanceAddressForm` pins the accepted forms.
 
 Two forms are refused, both deliberately:
 
@@ -80,6 +81,64 @@ Two forms are refused, both deliberately:
 **Cost accepted:** when TLS arrives it needs a config knob of its own (`service.tls: true` or a
 transport block) rather than coming free with a per-instance `https://`. That is the right shape
 anyway — see Q1.
+
+### D3 — The config file carries the whole schema, even the knobs nothing honours yet
+
+*Status: decided · affects CONFIG.md, `internal/config` · code: `config.Load`*
+
+`internal/config` parses, defaults and validates every field in CONFIG.md — including
+`outlier.*`, `retry.budget.*`, `perTryTimeout`, `inbound.*` and `app.address`, none of which has a
+consumer yet. Only `listeners.outbound`, `limits.maxHeaderBytes`, `log.level`, `reload.interval`, and per-service
+`instances`, `timeout`, `retry.maxAttempts` and `retry.maxBodyBytes` change behaviour today.
+
+**Why not a subset that grows with the features:** `KnownFields(true)` (validation rule 1, so a
+misspelled `maxAttemps` cannot silently default) means any field the structs do not know is a
+*startup error*. A subset would therefore make the documented example config fail to load, and
+every feature landing later would be a breaking config change for anyone who had written the
+documented form. Parsing the whole schema costs a struct field and a range check per knob.
+
+**The cost, and how it is paid:** a knob that validates but does nothing is a trap — an operator
+could set `outlier.consecutiveFailures: 3` and believe ejection is on. So the honoured set is listed
+at the top of CONFIG.md and marked in the committed `sidecar.yaml`, and each TODO item says which
+knob it switches on. If that turns out to be too subtle, the next step is a startup warning naming
+configured-but-inert fields.
+
+**All validation lives in `config`.** Instance address syntax first stayed in `routing`, on the
+theory that the rule belongs to the code that dials. Hot reload made that split expensive: config
+needed a hook to ask routing before storing a file, the table was built twice per reload, and
+`main` carried a panic for the case where the two disagreed — without the hook, one typo in an
+instance would have crashed the running sidecar on reload. Now `validate.go` is the whole
+rulebook and `routing.NewTable` cannot fail.
+
+**One service type, one set of defaults.** `routing.NewTable` takes `[]config.Service` and
+`routing.Service` embeds `config.Policy`, so there is no translation layer and no `0 → default`
+rule outside `config`. Code that builds a service by hand (tests, the demo) starts from
+`config.NewService`, which applies the same defaults a file gets.
+
+**Not decided here:** the per-service knobs that *do* have consumers today but still live as
+constants in `internal/proxy` (`backoff.base`/`max`, `minAttemptTime`). They already reach the
+proxy through the embedded policy; switching the constants over is next. (`retry.maxBodyBytes`
+made that switch first, after a review found the config value was silently ignored.)
+
+### D4 — On reload, restart-only fields keep their running value
+
+*Status: decided · affects DESIGN §8, CONFIG.md · code: `config.(*Config).keepStatic`*
+
+Some fields cannot change in a running process: `listeners.*`, `app.address`,
+`limits.maxHeaderBytes`, `reload.interval`. When a reload changes one, the sidecar applies the rest
+of the file, puts those fields back to their running values, and logs `config_restart_required`
+naming them.
+
+**Why not store the file as written and just warn:** `Current()` would then say the outbound
+listener is `:25102` while the process is bound to `:25101`. Anything reading the config — a
+future admin endpoint, a log line, the loop guard — would be told something false.
+
+**Why not reject the whole reload:** an operator who changes a timeout and, in the same edit, a
+listener would get *no* timeout change until they restart, which is a surprising way to find out
+a field is restart-only.
+
+The config is re-validated after the restore, because a cross-field rule can depend on a restored
+field: the loop guard checks instances against the inbound address actually in effect.
 
 ---
 

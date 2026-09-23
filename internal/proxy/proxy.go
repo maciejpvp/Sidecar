@@ -14,10 +14,6 @@ import (
 	"sidecar/internal/routing"
 )
 
-// Bodies up to this size are buffered so a retry can replay them. Anything
-// larger, or of unknown length, is streamed straight through and not retried.
-const maxReplayBodyBytes = 1 << 20
-
 type Resolver interface {
 	GetService(name string) (*routing.Service, bool)
 }
@@ -35,6 +31,14 @@ func New(routes Resolver, log *slog.Logger) *Handler {
 		// Owned rather than http.DefaultTransport so the connection pool is
 		// ours to tune, and so TLS plugs in here later.
 		transport: http.DefaultTransport.(*http.Transport).Clone(),
+	}
+}
+
+// CloseIdleConnections drops idle pooled connections after a routing swap.
+// Connections busy at that moment linger until the transport's idle timeout.
+func (h *Handler) CloseIdleConnections() {
+	if t, ok := h.transport.(interface{ CloseIdleConnections() }); ok {
+		t.CloseIdleConnections()
 	}
 }
 
@@ -71,21 +75,22 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 
 	out := r.WithContext(ctx)
-	if err := bufferBody(out); err != nil {
+	if err := bufferBody(out, svc.Retry.MaxBodyBytes); err != nil {
 		log.Error("failed to buffer request body", "error", err)
 		writeError(w, http.StatusBadRequest, "bad_request", "failed to read request body")
 		return
 	}
 
-	log.Debug("forwarding request", "timeout", svc.Timeout.String(), "maxAttempts", svc.MaxAttempts)
+	log.Debug("forwarding request", "timeout", svc.Timeout.String(), "maxAttempts", svc.Retry.MaxAttempts)
 	h.reverseProxy(svc, log).ServeHTTP(w, out)
 }
 
 // bufferBody makes the request replayable by reading it into memory and
 // handing out a fresh reader per attempt. Server-side requests have no GetBody
 // of their own, so without this a retry would silently send an empty body.
-func bufferBody(r *http.Request) error {
-	if r.Body == nil || r.ContentLength <= 0 || r.ContentLength > maxReplayBodyBytes {
+// Bodies over limit, or of unknown length, are streamed and never retried.
+func bufferBody(r *http.Request, limit int64) error {
+	if r.Body == nil || r.ContentLength <= 0 || r.ContentLength > limit {
 		return nil
 	}
 

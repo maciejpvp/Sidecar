@@ -1,7 +1,22 @@
 # Sidecar — Configuration Reference
 
 The sidecar reads one YAML file, passed with `-config` (default `./sidecar.yaml`).
-Design rationale for every field lives in [DESIGN.md](DESIGN.md).
+Design rationale for every field lives in [DESIGN.md](DESIGN.md); the repository root holds a
+working [sidecar.yaml](../sidecar.yaml).
+
+Every field below is **parsed, defaulted and validated** — a typo or an out-of-range value stops
+startup with exit 1 and a message naming the field. Not all of them are **honoured** yet, because
+the features they configure are still to come ([TODO.md](TODO.md)). What is honoured today:
+`listeners.outbound`, `limits.maxHeaderBytes`, `log.level`, `reload.interval`, and per-service
+`instances`, `timeout`, `retry.maxAttempts` and `retry.maxBodyBytes`.
+
+The file is **hot-reloaded**: it is polled every `reload.interval`, and a valid change takes effect
+without a restart — new routes, new timeouts, a new log level. An invalid change is logged as
+`config_rejected` once and the previous config stays in effect. Fields marked *no* in the
+Reloadable column keep their running value on reload; the rest of the change still applies, and
+`config_restart_required` names the fields that need a restart. Everything else is validated and then ignored, deliberately: a config file
+that documents the shape of the finished sidecar is worth more than one that grows a field at a
+time, and `KnownFields(true)` means an unparsed field would be a startup *error*, not a no-op.
 
 ## Full annotated example
 

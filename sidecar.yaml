@@ -1,0 +1,43 @@
+# Sidecar configuration. Every field is optional except a service's name and
+# instances; anything left out takes the default from docs/CONFIG.md, which is
+# also where each knob is explained.
+#
+#   go run . -config sidecar.yaml
+#
+# The file is hot-reloaded: edits take effect within reload.interval (2s by
+# default), and a broken edit is logged and ignored. Only the fields marked
+# below are honoured today — the rest are parsed and validated, and start
+# working as their features land (docs/TODO.md).
+
+listeners:
+  outbound: "127.0.0.1:15001"    # honoured: where the local app sends its calls
+  inbound: "0.0.0.0:15000"       # not yet: no inbound listener exists
+
+app:
+  address: "127.0.0.1:8080"      # not yet: used by the inbound listener
+
+defaults:
+  timeout: 5s                    # honoured: whole-request budget, all attempts
+  retry:
+    maxAttempts: 3               # honoured: total attempts, 1 disables retries
+
+services:
+  # The local app reaches this one as `Host: orders-svc`, e.g.
+  #   curl -H 'Host: orders-svc' http://127.0.0.1:15001/v1/orders/42
+  - name: orders-svc
+    instances:                   # other sidecars' inbound ports, host:port
+      - "127.0.0.1:15010"
+      - "127.0.0.1:15011"
+      - "127.0.0.1:15012"
+    timeout: 2s
+
+  # Payments are not safe to replay blindly, so this one never retries from the
+  # sidecar even though the default above allows three attempts.
+  - name: payments-svc
+    instances:
+      - "127.0.0.1:15020"
+    retry:
+      maxAttempts: 1
+
+log:
+  level: debug

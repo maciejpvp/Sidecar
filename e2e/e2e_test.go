@@ -5,23 +5,21 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
-	"sidecar/internal/routing"
+	"sidecar/internal/config"
 )
-
-func instances(urls ...string) routing.ServiceConfig {
-	return routing.ServiceConfig{Instances: urls}
-}
 
 func quietLogger() *slog.Logger {
 	return slog.New(slog.NewJSONHandler(io.Discard, nil))
 }
 
-func startSidecar(t *testing.T, routes map[string]routing.ServiceConfig) *Sidecar {
+func startSidecar(t *testing.T, services ...config.Service) *Sidecar {
 	t.Helper()
-	s, err := StartSidecar("127.0.0.1:0", routes, quietLogger())
+	s, err := StartSidecar("127.0.0.1:0", services, quietLogger())
 	if err != nil {
 		t.Fatalf("start sidecar: %v", err)
 	}
@@ -51,7 +49,7 @@ func TestRequestFromAToB(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			b := startEcho(t, "service-b")
-			sc := startSidecar(t, map[string]routing.ServiceConfig{"service-b": instances(b.Addr)})
+			sc := startSidecar(t, config.NewService("service-b", b.Addr))
 
 			res, err := tc.call(sc.Addr, "service-b", tc.path)
 			if err != nil {
@@ -116,9 +114,7 @@ func TestInstanceAddressFamilies(t *testing.T) {
 			// port — "localhost" resolves to both families.
 			for _, instance := range []string{b.Addr, "localhost:" + port} {
 				t.Run(instance, func(t *testing.T) {
-					sc := startSidecar(t, map[string]routing.ServiceConfig{
-						"service-b": instances(instance),
-					})
+					sc := startSidecar(t, config.NewService("service-b", instance))
 
 					res, err := Call(sc.Addr, "service-b", "/v1/hello")
 					if err != nil {
@@ -146,7 +142,7 @@ func TestInstanceAddressFamilies(t *testing.T) {
 
 func TestUnknownService(t *testing.T) {
 	b := startEcho(t, "service-b")
-	sc := startSidecar(t, map[string]routing.ServiceConfig{"service-b": instances(b.Addr)})
+	sc := startSidecar(t, config.NewService("service-b", b.Addr))
 
 	res, err := Call(sc.Addr, "service-nope", "/v1/hello")
 	if err != nil {
@@ -178,7 +174,7 @@ func TestUpstreamDown(t *testing.T) {
 	addr := b.Addr
 	b.Close() // the address is now dead, but still in the routing table
 
-	sc := startSidecar(t, map[string]routing.ServiceConfig{"service-b": instances(addr)})
+	sc := startSidecar(t, config.NewService("service-b", addr))
 
 	res, err := Call(sc.Addr, "service-b", "/v1/hello")
 	if err != nil {
@@ -196,7 +192,7 @@ func TestUpstreamDown(t *testing.T) {
 func TestRoundRobin(t *testing.T) {
 	b1 := startEcho(t, "service-b#1")
 	b2 := startEcho(t, "service-b#2")
-	sc := startSidecar(t, map[string]routing.ServiceConfig{"service-b": instances(b1.Addr, b2.Addr)})
+	sc := startSidecar(t, config.NewService("service-b", b1.Addr, b2.Addr))
 
 	const calls = 4
 	for i := range calls {
@@ -225,9 +221,9 @@ func TestDeadlineExceeded(t *testing.T) {
 
 	b := StartSlowEcho("service-b", delay)
 	t.Cleanup(b.Close)
-	sc := startSidecar(t, map[string]routing.ServiceConfig{
-		"service-b": {Instances: []string{b.Addr}, Timeout: timeout},
-	})
+	svc := config.NewService("service-b", b.Addr)
+	svc.Timeout = timeout
+	sc := startSidecar(t, svc)
 
 	start := time.Now()
 	res, err := Call(sc.Addr, "service-b", "/v1/hello")
@@ -258,9 +254,9 @@ func TestDeadlineExceeded(t *testing.T) {
 func TestSlowButWithinBudget(t *testing.T) {
 	b := StartSlowEcho("service-b", 50*time.Millisecond)
 	t.Cleanup(b.Close)
-	sc := startSidecar(t, map[string]routing.ServiceConfig{
-		"service-b": {Instances: []string{b.Addr}, Timeout: 2 * time.Second},
-	})
+	svc := config.NewService("service-b", b.Addr)
+	svc.Timeout = 2 * time.Second
+	sc := startSidecar(t, svc)
 
 	res, err := Call(sc.Addr, "service-b", "/v1/hello")
 	if err != nil {
@@ -281,7 +277,7 @@ func TestSlowButWithinBudget(t *testing.T) {
 
 // "Nowhere to send it" is 503, not the 404 of "no such service".
 func TestNoInstances(t *testing.T) {
-	sc := startSidecar(t, map[string]routing.ServiceConfig{"service-b": instances()})
+	sc := startSidecar(t, config.NewService("service-b"))
 
 	res, err := Call(sc.Addr, "service-b", "/v1/hello")
 	if err != nil {
@@ -293,5 +289,60 @@ func TestNoInstances(t *testing.T) {
 	}
 	if code := res.Header.Get("X-Sidecar-Error"); code != "no_healthy_upstream" {
 		t.Errorf("X-Sidecar-Error = %q, want no_healthy_upstream", code)
+	}
+}
+
+// A broken edit must leave the sidecar serving the last good table.
+func TestHotReloadReroutes(t *testing.T) {
+	b1 := startEcho(t, "service-b#1")
+	b2 := startEcho(t, "service-b#2")
+
+	path := filepath.Join(t.TempDir(), "sidecar.yaml")
+	route := func(addr string) {
+		t.Helper()
+		body := "services:\n  - name: service-b\n    instances: [\"" + addr + "\"]\n"
+		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+			t.Fatalf("write config: %v", err)
+		}
+	}
+
+	route(b1.Addr)
+	sc, cfg, err := StartSidecarFromConfig("127.0.0.1:0", path, quietLogger())
+	if err != nil {
+		t.Fatalf("start sidecar: %v", err)
+	}
+	t.Cleanup(sc.Close)
+
+	reached := func() string {
+		t.Helper()
+		res, err := Call(sc.Addr, "service-b", "/v1/hello")
+		if err != nil {
+			t.Fatalf("call service-b: %v", err)
+		}
+		got, err := ReadReceived(res)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return got.Service
+	}
+
+	if got := reached(); got != "service-b#1" {
+		t.Fatalf("before reload reached %q, want service-b#1", got)
+	}
+
+	route(b2.Addr)
+	if err := cfg.Reload(); err != nil {
+		t.Fatalf("Reload: %v", err)
+	}
+	if got := reached(); got != "service-b#2" {
+		t.Errorf("after reload reached %q, want service-b#2", got)
+	}
+
+	route("http://" + b1.Addr)
+	if err := cfg.Reload(); err == nil {
+		t.Fatal("Reload accepted an instance with a scheme")
+	}
+	if got := reached(); got != "service-b#2" {
+		t.Errorf("after a rejected reload reached %q, want service-b#2 still", got)
 	}
 }

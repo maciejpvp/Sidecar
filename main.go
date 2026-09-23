@@ -1,57 +1,48 @@
 package main
 
 import (
+	"context"
 	"errors"
+	"flag"
 	"log/slog"
 	"net"
 	"net/http"
 	"os"
-	"time"
 
+	"sidecar/internal/config"
 	"sidecar/internal/logging"
-	"sidecar/internal/proxy"
-	"sidecar/internal/routing"
+	"sidecar/internal/sidecar"
 )
 
-// Loopback only: on any other interface this is an open proxy into the mesh.
-const outboundAddr = "127.0.0.1:15001"
-
 func main() {
+	path := flag.String("config", config.DefaultPath, "path to the YAML configuration file")
+	flag.Parse()
+
 	var level slog.LevelVar
-	level.Set(slog.LevelDebug)
 	logger := logging.New(&level)
 	slog.SetDefault(logger)
 
-	table, err := routing.NewTable(map[string]routing.ServiceConfig{
-		"billing": {
-			Instances: []string{"10.0.0.1:15000", "10.0.0.2:15000", "10.0.0.3:15000"},
-			Timeout:   2 * time.Second,
-		},
-		"inventory": {Instances: []string{"10.0.1.7:15000"}},
-	})
+	cfg, err := config.New(*path, config.WithLogger(logger))
 	if err != nil {
-		slog.Error("invalid routing table", "error", err)
+		slog.Error("config_rejected", "error", err)
 		os.Exit(1)
 	}
 
-	p := proxy.New(table, logger)
+	handler := sidecar.Handler(cfg, &level, logger)
+	// Background until shutdown handling exists (TODO P0).
+	go cfg.Watch(context.Background())
 
-	ln, err := net.Listen("tcp", outboundAddr)
+	addr := cfg.Current().Listeners.Outbound
+	ln, err := net.Listen("tcp", addr)
 	if err != nil {
-		slog.Error("outbound listener failed to bind", "addr", outboundAddr, "error", err)
+		slog.Error("outbound listener failed to bind", "addr", addr, "error", err)
 		os.Exit(1)
 	}
 
 	slog.Info("ready", "dir", "outbound", "addr", ln.Addr().String())
 
-	// No ReadTimeout/WriteTimeout: they would cap the whole exchange, fighting
-	// the per-service deadline and cutting off streaming responses.
-	srv := &http.Server{
-		Handler:           p,
-		ReadHeaderTimeout: 10 * time.Second,
-	}
-	if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		slog.Error("outbound listener stopped", "addr", outboundAddr, "error", err)
+	if err := sidecar.Server(cfg, handler).Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		slog.Error("outbound listener stopped", "addr", addr, "error", err)
 		os.Exit(1)
 	}
 }

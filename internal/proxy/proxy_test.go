@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"sidecar/internal/config"
 	"sidecar/internal/routing"
 )
 
@@ -78,12 +79,13 @@ func closedAddr(t *testing.T) string {
 	return addr
 }
 
-func newSidecar(t *testing.T, cfg routing.ServiceConfig) *httptest.Server {
+func service(instances ...string) config.Service {
+	return config.NewService("svc", instances...)
+}
+
+func newSidecar(t *testing.T, svc config.Service) *httptest.Server {
 	t.Helper()
-	table, err := routing.NewTable(map[string]routing.ServiceConfig{"svc": cfg})
-	if err != nil {
-		t.Fatalf("build table: %v", err)
-	}
+	table := routing.NewTable([]config.Service{svc})
 	srv := httptest.NewServer(New(table, slog.New(slog.DiscardHandler)))
 	t.Cleanup(srv.Close)
 	return srv
@@ -108,9 +110,7 @@ func TestRetriesOntoHealthyInstance(t *testing.T) {
 	bad := newUpstream(t, http.StatusServiceUnavailable)
 	good := newUpstream(t, http.StatusOK)
 
-	sidecar := newSidecar(t, routing.ServiceConfig{
-		Instances: []string{bad.addr(), good.addr()},
-	})
+	sidecar := newSidecar(t, service(bad.addr(), good.addr()))
 
 	res := call(t, sidecar, http.MethodGet, nil)
 
@@ -130,10 +130,9 @@ func TestGivesUpAfterMaxAttempts(t *testing.T) {
 	b := newUpstream(t, http.StatusServiceUnavailable)
 	c := newUpstream(t, http.StatusServiceUnavailable)
 
-	sidecar := newSidecar(t, routing.ServiceConfig{
-		Instances:   []string{a.addr(), b.addr(), c.addr()},
-		MaxAttempts: 3,
-	})
+	svc := service(a.addr(), b.addr(), c.addr())
+	svc.Retry.MaxAttempts = 3
+	sidecar := newSidecar(t, svc)
 
 	res := call(t, sidecar, http.MethodGet, nil)
 
@@ -156,10 +155,9 @@ func TestLapsOverInstances(t *testing.T) {
 	a := newUpstream(t, http.StatusServiceUnavailable)
 	b := newUpstream(t, http.StatusServiceUnavailable)
 
-	sidecar := newSidecar(t, routing.ServiceConfig{
-		Instances:   []string{a.addr(), b.addr()},
-		MaxAttempts: 5,
-	})
+	svc := service(a.addr(), b.addr())
+	svc.Retry.MaxAttempts = 5
+	sidecar := newSidecar(t, svc)
 
 	call(t, sidecar, http.MethodGet, nil)
 
@@ -178,10 +176,9 @@ func TestLapsOverInstances(t *testing.T) {
 func TestSingleInstanceStillRetries(t *testing.T) {
 	only := newUpstream(t, http.StatusServiceUnavailable)
 
-	sidecar := newSidecar(t, routing.ServiceConfig{
-		Instances:   []string{only.addr()},
-		MaxAttempts: 3,
-	})
+	svc := service(only.addr())
+	svc.Retry.MaxAttempts = 3
+	sidecar := newSidecar(t, svc)
 
 	call(t, sidecar, http.MethodGet, nil)
 
@@ -193,10 +190,9 @@ func TestSingleInstanceStillRetries(t *testing.T) {
 func TestSingleInstanceRecovers(t *testing.T) {
 	flaky := newFlakyUpstream(t, 1)
 
-	sidecar := newSidecar(t, routing.ServiceConfig{
-		Instances:   []string{flaky.addr()},
-		MaxAttempts: 3,
-	})
+	svc := service(flaky.addr())
+	svc.Retry.MaxAttempts = 3
+	sidecar := newSidecar(t, svc)
 
 	res := call(t, sidecar, http.MethodGet, nil)
 
@@ -224,9 +220,7 @@ func TestNonRetriableStatusesPassThrough(t *testing.T) {
 			first := newUpstream(t, tc.status)
 			second := newUpstream(t, http.StatusOK)
 
-			sidecar := newSidecar(t, routing.ServiceConfig{
-				Instances: []string{first.addr(), second.addr()},
-			})
+			sidecar := newSidecar(t, service(first.addr(), second.addr()))
 
 			res := call(t, sidecar, http.MethodGet, nil)
 
@@ -247,9 +241,7 @@ func TestDoesNotRetryPOST(t *testing.T) {
 	bad := newUpstream(t, http.StatusServiceUnavailable)
 	good := newUpstream(t, http.StatusOK)
 
-	sidecar := newSidecar(t, routing.ServiceConfig{
-		Instances: []string{bad.addr(), good.addr()},
-	})
+	sidecar := newSidecar(t, service(bad.addr(), good.addr()))
 
 	res := call(t, sidecar, http.MethodPost, strings.NewReader("charge the card"))
 
@@ -267,9 +259,7 @@ func TestReplaysBufferedBody(t *testing.T) {
 	bad := newUpstream(t, http.StatusServiceUnavailable)
 	good := newUpstream(t, http.StatusOK)
 
-	sidecar := newSidecar(t, routing.ServiceConfig{
-		Instances: []string{bad.addr(), good.addr()},
-	})
+	sidecar := newSidecar(t, service(bad.addr(), good.addr()))
 
 	res := call(t, sidecar, http.MethodPut, strings.NewReader(payload))
 
@@ -281,15 +271,32 @@ func TestReplaysBufferedBody(t *testing.T) {
 	}
 }
 
+// A body over the service's retry.maxBodyBytes is streamed, so it is not retried.
+func TestReplayLimitComesFromService(t *testing.T) {
+	bad := newUpstream(t, http.StatusServiceUnavailable)
+	good := newUpstream(t, http.StatusOK)
+
+	svc := service(bad.addr(), good.addr())
+	svc.Retry.MaxBodyBytes = 4
+	sidecar := newSidecar(t, svc)
+
+	res := call(t, sidecar, http.MethodPut, strings.NewReader("longer than four bytes"))
+
+	if res.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want 503 (not retried)", res.StatusCode)
+	}
+	if got := good.hits.Load(); got != 0 {
+		t.Errorf("second instance hits = %d, want 0 (body over retry.maxBodyBytes)", got)
+	}
+}
+
 // A body of unknown length is streamed, so there is nothing to replay and the
 // request must not be retried.
 func TestDoesNotRetryUnbufferedBody(t *testing.T) {
 	bad := newUpstream(t, http.StatusServiceUnavailable)
 	good := newUpstream(t, http.StatusOK)
 
-	sidecar := newSidecar(t, routing.ServiceConfig{
-		Instances: []string{bad.addr(), good.addr()},
-	})
+	sidecar := newSidecar(t, service(bad.addr(), good.addr()))
 
 	// io.NopCloser hides the concrete type, so ContentLength stays unknown and
 	// the request goes out chunked.
@@ -308,9 +315,7 @@ func TestRetriesDialFailureForAnyMethod(t *testing.T) {
 	dead := closedAddr(t)
 	good := newUpstream(t, http.StatusOK)
 
-	sidecar := newSidecar(t, routing.ServiceConfig{
-		Instances: []string{dead, good.addr()},
-	})
+	sidecar := newSidecar(t, service(dead, good.addr()))
 
 	res := call(t, sidecar, http.MethodPost, strings.NewReader("safe: never sent"))
 
@@ -323,9 +328,7 @@ func TestRetriesDialFailureForAnyMethod(t *testing.T) {
 }
 
 func TestAllInstancesUnreachable(t *testing.T) {
-	sidecar := newSidecar(t, routing.ServiceConfig{
-		Instances: []string{closedAddr(t), closedAddr(t)},
-	})
+	sidecar := newSidecar(t, service(closedAddr(t), closedAddr(t)))
 
 	res := call(t, sidecar, http.MethodGet, nil)
 
@@ -351,10 +354,9 @@ func TestRetriesStopAtDeadline(t *testing.T) {
 		return srv.Listener.Addr().String()
 	}
 
-	sidecar := newSidecar(t, routing.ServiceConfig{
-		Instances: []string{newSlow(), newSlow()},
-		Timeout:   150 * time.Millisecond,
-	})
+	svc := service(newSlow(), newSlow())
+	svc.Timeout = 150 * time.Millisecond
+	sidecar := newSidecar(t, svc)
 
 	start := time.Now()
 	res := call(t, sidecar, http.MethodGet, nil)

@@ -375,10 +375,12 @@ type Transport interface {
     RoundTrip(*http.Request) (*http.Response, error)
 }
 
-// ConfigSource produces validated configs; v1 = file poller.
-type ConfigSource interface {
-    Watch(ctx context.Context) <-chan *config.Config
-}
+// config.Source owns the file: load, validate, store, poll, swap (§8).
+cfg, err := config.New(path)                 // first load; error -> exit 1
+cfg.Current() *config.Config                // immutable snapshot, read once per use
+cfg.OnChange(func(old, next *config.Config)) // runs after a reload is committed
+cfg.Reload() error                           // one pass now
+cfg.Watch(ctx)                               // polls every reload.interval
 
 type AttemptResult struct {
     Status      int
@@ -392,13 +394,15 @@ type AttemptResult struct {
 
 ```
 cmd/sidecar/            main: flags, load config, start listeners, signal handling
-internal/config/        YAML structs, defaults, validation, file poller (ConfigSource)
+internal/config/        YAML structs, defaults, validation, config.Source (poll + swap)
 internal/routing/       RoutingTable build from config, state carry-over
 internal/balancer/      round-robin
 internal/resilience/    deadline, retry policy, retry budget, outlier detector
 internal/proxy/http/    HTTP Protocol: outbound handler, inbound handler, header utils
 internal/errors/        sidecar error codes + JSON writer
 internal/logging/       slog setup, access log helper
+internal/sidecar/       wiring: config.Source -> routing store -> proxy, re-wired on reload;
+                        shared by main and the e2e harness so tests exercise what ships
 docs/                   this documentation
 ```
 
@@ -439,16 +443,23 @@ error. Sidecar errors only happen when there is nothing better to return.
 
 Config file format: see [CONFIG.md](CONFIG.md).
 
-- A goroutine `stat`s the file every `reload.interval` (default 2 s). On mtime or size change it
-  reads, parses, applies defaults and **validates** (§CONFIG validation rules).
+- `config.Source.Watch` `stat`s the file every `reload.interval` (default 2 s). On mtime or size
+  change it reads, parses, applies defaults and **validates** (§CONFIG validation rules). Every
+  rule lives in `config`, instance addresses included, so whatever validates is guaranteed to
+  build a routing table — `routing.NewTable` does no checking of its own.
+- The mtime/size stamp moves on **every** change seen, good or bad, so a broken file is rejected
+  and logged once, not every tick. A missing file (an editor saving by rename) is one more change.
 - **Invalid** → log `config_rejected` with the error, keep serving the old table.
-- **Valid** → build a new `RoutingTable` and `Store` it in the `atomic.Pointer`. Requests
-  already running keep using their snapshot, so no request sees a half-updated table.
+- **Valid** → the new `*Config` is stored and `OnChange` subscribers run; `main` rebuilds the
+  routing table and swaps it into `routing.Store` (an `atomic.Pointer`). Requests already running
+  keep using their snapshot, so no request sees a half-updated table.
 - **State carry-over**: outlier state and retry budgets are looked up by key
   (`service` for budgets, `service|addr` for instances) in the old table and reused. Removed
   instances drop their state; new instances start healthy. Round-robin counters reset (harmless).
-- Listener addresses and the app address are **not** hot-reloadable (logged as a warning if changed;
-  restart required).
+- Listener addresses, the app address, `limits.maxHeaderBytes` and `reload.interval` are **not**
+  hot-reloadable. A reload that changes them still applies everything else, but those fields keep
+  their running values and `config_restart_required` names them — so `Current()` never reports a
+  listener the process is not bound to (QUESTIONS D4).
 - Connections to removed instances are closed by `Transport.CloseIdleConnections()` after the swap;
   in-flight requests to them complete normally.
 
@@ -486,7 +497,7 @@ One JSON line per request (slog `JSONHandler`):
 {"time":"2026-09-13T10:00:00.123Z","level":"INFO","msg":"access","dir":"outbound","requestId":"7f3a…","traceId":"4bf9…","method":"GET","service":"orders-svc","path":"/v1/orders/42","status":200,"attempts":2,"instances":["10.0.0.7:15000","10.0.0.8:15000"],"durationMs":184,"deadlineMs":2600,"sidecarError":""}
 ```
 
-Event logs: `config_loaded`, `config_rejected`, `instance_ejected`, `instance_restored`,
+Event logs: `config_loaded`, `config_rejected`, `config_restart_required`, `instance_ejected`, `instance_restored`,
 `retry_budget_exhausted`, `shutdown_started`, `shutdown_complete`.
 
 ---

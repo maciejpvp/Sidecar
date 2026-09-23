@@ -5,9 +5,10 @@ Design rationale for every item lives in [DESIGN.md](DESIGN.md) (section refs be
 already settled are in [QUESTIONS.md](QUESTIONS.md).
 
 Current state: outbound-only proxy on `127.0.0.1:15001`, services addressed by `Host`
-(QUESTIONS D1), hardcoded service table of `host:port` instances (QUESTIONS D2), round-robin with
-retries on a fresh instance, per-service request deadline, JSON error model, JSON logger.
-End-to-end demo and tests in [../e2e](../e2e). No config file, no inbound listener, no access log.
+(QUESTIONS D1), service table loaded from `sidecar.yaml` with `host:port` instances (QUESTIONS D2,
+D3), round-robin with retries on a fresh instance, per-service request deadline, JSON error model,
+JSON logger, hot reload of the config file (QUESTIONS D4). End-to-end demo and tests in
+[../e2e](../e2e). No inbound listener, no access log, no graceful shutdown.
 
 ---
 
@@ -28,13 +29,21 @@ End-to-end demo and tests in [../e2e](../e2e). No config file, no inbound listen
   *Done:* `curl -H 'Host: echo' 127.0.0.1:15001/hello` reaches an echo server, unknown name → 404
   `no_route`; both addressing forms are covered in `e2e.TestRequestFromAToB`.
 
-- [ ] **YAML config: parse → defaults → validate** (CONFIG.md, DESIGN §8) — the hardcoded map
-  blocks literally every feature below, since retries, timeouts and ejection are all per-service
-  knobs. Include `KnownFields(true)` so typos fail loudly, and the validation rules in CONFIG.md §Validation.
-  *Done when:* startup loads `sidecar.yaml`; an invalid file exits 1 with a precise error.
+- [x] **YAML config: parse → defaults → validate** (CONFIG.md, DESIGN §8) — `internal/config`,
+  loaded from `-config` (default `sidecar.yaml`). `KnownFields(true)` so a typo fails loudly;
+  field-by-field inheritance from `defaults`; every CONFIG.md §Validation rule, instance addresses
+  included, lives in `config/validate.go` (QUESTIONS D3). All problems are reported in one go, so
+  an operator does not restart once per mistake.
+  *Done:* startup loads `sidecar.yaml`; an invalid file exits 1 with a precise error naming the
+  field. The whole schema is parsed and validated, but only `listeners.outbound`,
+  `limits.maxHeaderBytes`, `log.level`, `instances`, `timeout`, `retry.maxAttempts` and
+  `retry.maxBodyBytes` are honoured yet — see the note at the top of CONFIG.md.
+  - Next: `transport.go` still holds `backoff.base`/`max` and `minAttemptTime` as constants.
+    `routing.Service` embeds `config.Policy`, so wiring them is a matter of reading
+    `svc.Retry.Backoff.Base` and friends in place of the constants.
 
-- [ ] **Package layout + lifecycle** (DESIGN §6.1, §9) — move `main.go` → `cmd/sidecar/`, add
-  `-config` flag, signal handling, `http.Server.Shutdown` with a drain timeout.
+- [ ] **Package layout + lifecycle** (DESIGN §6.1, §9) — move `main.go` → `cmd/sidecar/` (`-config`
+  already exists), signal handling — and pass that context to `cfg.Watch` instead of `Background` — `http.Server.Shutdown` with a drain timeout.
   *Done when:* Ctrl+C drains in-flight requests instead of cutting them.
 
 - [x] **Per-request timeout** — `service.timeout` → `context.WithTimeout` → 504
@@ -80,19 +89,24 @@ End-to-end demo and tests in [../e2e](../e2e). No config file, no inbound listen
   `traceparent` generation/validation, deadline clamp, forward to the app. No retries, no LB.
   Unlocks true sidecar→sidecar chains; until this exists, propagation is untestable end to end.
 
-- [ ] **Hot reload: mtime poll + atomic table swap + state carry-over** (DESIGN §8) — the part
-  people get subtly wrong. Invalid config must keep serving the old table; outlier state and
-  budgets carry over by key, or every reload silently un-ejects every broken instance.
-  *Done when:* editing YAML changes routing with no restart and no dropped request.
+- [~] **Hot reload: mtime poll + atomic table swap + state carry-over** (DESIGN §8) — `config.Source`
+  polls, validates and stores; `routing.Store` swaps the table; idle
+  connections are closed after a swap. Invalid files are rejected once and the old table keeps
+  serving; restart-only fields keep their running value (QUESTIONS D4).
+  *Done:* editing YAML changes routing with no restart (`e2e.TestHotReloadReroutes`).
+  Still open: outlier state and budgets carrying over by key — nothing to carry until those
+  features exist, but it must land *with* them, or every reload silently un-ejects every broken
+  instance.
 
 ---
 
 ## P2 — Hardening
 
-- [ ] Body buffering up to `retry.maxBodyBytes`, hard cap at `limits.maxBodyBytes` → 413.
+- [~] Body buffering up to `retry.maxBodyBytes` (done, per service), hard cap at `limits.maxBodyBytes` → 413 (not yet).
 - [ ] Hop-by-hop header stripping, `Connection`-listed headers, correct `X-Forwarded-For`.
-- [ ] Loop guard: reject a config listing this sidecar's own inbound address (CONFIG §Validation 7).
-- [ ] Transport tuning: connection pool sizes, `CloseIdleConnections()` after a table swap.
+- [x] Loop guard: reject a config listing this sidecar's own inbound address (CONFIG §Validation 7) —
+      landed with config validation, including `0.0.0.0:15000` vs `127.0.0.1:15000` spellings.
+- [~] Transport tuning: connection pool sizes. (`CloseIdleConnections()` after a table swap is done.)
 - [ ] `-race` on the whole suite + one end-to-end test with two in-process sidecars.
 - [ ] Error-model audit: sidecar errors only when there's no real upstream response to return (§7).
 

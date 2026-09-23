@@ -14,8 +14,10 @@ import (
 	"sync/atomic"
 	"time"
 
+	"sidecar/internal/config"
 	"sidecar/internal/proxy"
 	"sidecar/internal/routing"
+	"sidecar/internal/sidecar"
 )
 
 // Received is the view from the far side of the sidecar hop.
@@ -96,25 +98,36 @@ type Sidecar struct {
 	srv *http.Server
 }
 
-// Instances are host:port, the same form the config file uses.
-func StartSidecar(addr string, routes map[string]routing.ServiceConfig, log *slog.Logger) (*Sidecar, error) {
+// StartSidecar routes to services built with config.NewService.
+func StartSidecar(addr string, services []config.Service, log *slog.Logger) (*Sidecar, error) {
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return nil, fmt.Errorf("bind outbound listener on %s: %w", addr, err)
 	}
 
-	table, err := routing.NewTable(routes)
-	if err != nil {
-		ln.Close()
-		return nil, fmt.Errorf("build routing table: %w", err)
-	}
-
 	s := &Sidecar{
 		Addr: ln.Addr().String(),
-		srv:  &http.Server{Handler: proxy.New(table, log)},
+		srv:  &http.Server{Handler: proxy.New(routing.NewTable(services), log)},
 	}
 	go s.srv.Serve(ln)
 	return s, nil
+}
+
+// StartSidecarFromConfig starts a sidecar from a config file with main's wiring,
+// listening on addr rather than listeners.outbound so tests can use any port.
+func StartSidecarFromConfig(addr, path string, log *slog.Logger) (*Sidecar, *config.Source, error) {
+	cfg, err := config.New(path, config.WithLogger(log))
+	if err != nil {
+		return nil, nil, err
+	}
+
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return nil, nil, fmt.Errorf("bind outbound listener on %s: %w", addr, err)
+	}
+	s := &Sidecar{Addr: ln.Addr().String(), srv: sidecar.Server(cfg, sidecar.Handler(cfg, nil, log))}
+	go s.srv.Serve(ln)
+	return s, cfg, nil
 }
 
 func (s *Sidecar) Close() {
