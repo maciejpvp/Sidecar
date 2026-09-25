@@ -54,7 +54,8 @@ End-to-end demo and tests in [../e2e](../e2e). No inbound listener, no access lo
   `mesh.yaml`, registration gated on the app's health, `503 mesh_not_ready` before the first
   snapshot, Kubernetes manifests with native sidecars.
   *Done:* `e2e.TestScaleOutAndIn`, `TestUnhealthyAppLeavesTheMesh`, `TestControlPlaneRestart`.
-  *Not yet verified on a real cluster* — the manifests have only been parsed, not applied.
+  On a real cluster: `deploy/e2e.sh` (kind) — discovery, routing, scale out/in by deregistration,
+  control-plane restart under traffic, ConfigMap policy hot reload.
 
 - [x] **Per-request timeout** — `service.timeout` → `context.WithTimeout` → 504
   `deadline_exceeded`, covering the response body as well as time to first byte. Full two-header
