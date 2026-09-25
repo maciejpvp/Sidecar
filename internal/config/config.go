@@ -1,185 +1,83 @@
-// Package config loads the sidecar's YAML file: parse, apply defaults, validate
-// (format: docs/CONFIG.md). Every rule lives here, so whatever Load accepts the
-// rest of the program uses without checking again.
+// Package config holds both configuration files and every rule about them:
+// parse, apply defaults, validate (format: docs/CONFIG.md). Whatever this
+// package accepts, the rest of the program uses without checking again.
+//
+// There are two files, owned by two processes:
+//
+//   - Sidecar (sidecar.yaml, optional): how one sidecar runs — listeners, the
+//     local app, where the control plane is, which service this pod is. Read
+//     once at startup; in Kubernetes it usually comes from environment
+//     variables alone.
+//   - Mesh (mesh.yaml): what every sidecar should do — per-service timeouts,
+//     retries and outlier settings. Read by the control plane, hot-reloaded,
+//     and delivered to sidecars inside each snapshot together with the
+//     instances that registered themselves.
+//
+// Instances are in neither file: they come from registration (DESIGN §13).
 package config
 
 import (
 	"errors"
-	"fmt"
 	"io"
-	"log/slog"
-	"os"
 	"time"
 
 	"gopkg.in/yaml.v3"
 )
 
-const DefaultPath = "sidecar.yaml"
-
-// Config is a whole configuration with nothing left unset.
-type Config struct {
-	Listeners Listeners
-	App       App
-	Inbound   Inbound
-	Limits    Limits
-	Reload    Reload
-	Shutdown  Shutdown
-	Log       Log
-	// Validated on its own, so a file with no services still fails on a broken default.
-	Defaults Policy
-	Services []Service // in file order
-}
-
-type Listeners struct {
-	Inbound  string
-	Outbound string // loopback only, or the sidecar is an open proxy into the mesh
-}
-
-type App struct {
-	Address string
-}
-
-type Inbound struct {
-	DefaultTimeout time.Duration
-	MaxTimeout     time.Duration
-}
-
-type Limits struct {
-	MaxBodyBytes   int64
-	MaxHeaderBytes int
-}
-
-type Reload struct {
-	Interval time.Duration // 0 disables hot reload
-}
-
-type Shutdown struct {
-	DrainTimeout time.Duration
-}
-
-type Log struct {
-	Level slog.Level
-}
-
+// Service is one resolved route: a name, the instances currently registered
+// for it, and the policy the mesh file gives it. It is what a control-plane
+// snapshot carries and what routing builds a table from.
 type Service struct {
-	Name      string
-	Instances []string // host:port
-	Policy
+	Name      string   `json:"name"`
+	Instances []string `json:"instances"` // host:port
+	Policy    `json:"policy"`
 }
 
 // NewService is a service with the default policy. Zero never means "default"
 // outside this package, so services built in code must start here, not Service{}.
 func NewService(name string, instances ...string) Service {
-	s := Service{Name: name, Instances: instances}
-	s.Policy.defaults()
-	return s
+	return Service{Name: name, Instances: instances, Policy: DefaultPolicy()}
 }
 
+// Policy is everything about calling a service except where it is. Durations
+// travel as nanoseconds on the control-plane wire.
 type Policy struct {
-	Timeout       time.Duration
-	PerTryTimeout time.Duration // 0 = no per-attempt limit
-	Retry         Retry
-	Outlier       Outlier
+	Timeout       time.Duration `json:"timeout"`
+	PerTryTimeout time.Duration `json:"perTryTimeout"` // 0 = no per-attempt limit
+	Retry         Retry         `json:"retry"`
+	Outlier       Outlier       `json:"outlier"`
 }
 
 type Retry struct {
-	MaxAttempts    int   // total attempts including the first; 1 = no retries
-	MaxBodyBytes   int64 // larger bodies are streamed and never retried
-	MinAttemptTime time.Duration
-	Backoff        Backoff
-	Budget         Budget
+	MaxAttempts    int           `json:"maxAttempts"`  // total attempts including the first; 1 = no retries
+	MaxBodyBytes   int64         `json:"maxBodyBytes"` // larger bodies are streamed and never retried
+	MinAttemptTime time.Duration `json:"minAttemptTime"`
+	Backoff        Backoff       `json:"backoff"`
+	Budget         Budget        `json:"budget"`
 }
 
 type Backoff struct {
-	Base time.Duration
-	Max  time.Duration
+	Base time.Duration `json:"base"`
+	Max  time.Duration `json:"max"`
 }
 
 type Budget struct {
-	Ratio        float64
-	MinPerSecond int
-	Window       time.Duration
+	Ratio        float64       `json:"ratio"`
+	MinPerSecond int           `json:"minPerSecond"`
+	Window       time.Duration `json:"window"`
 }
 
 type Outlier struct {
-	ConsecutiveFailures int
-	BaseEjection        time.Duration
-	MaxEjection         time.Duration
-	MaxEjectionPercent  int
-	DecayAfter          time.Duration
+	ConsecutiveFailures int           `json:"consecutiveFailures"`
+	BaseEjection        time.Duration `json:"baseEjection"`
+	MaxEjection         time.Duration `json:"maxEjection"`
+	MaxEjectionPercent  int           `json:"maxEjectionPercent"`
+	DecayAfter          time.Duration `json:"decayAfter"`
 }
 
-// Load reads, resolves and validates the file at path.
-func Load(path string) (*Config, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-
-	var cfg Config
-	if err := cfg.read(f); err != nil {
-		return nil, fmt.Errorf("%s: %w", path, err)
-	}
-	return &cfg, nil
-}
-
-func (c *Config) read(r io.Reader) error {
-	dec := yaml.NewDecoder(r)
-	// A typo must fail loudly, not quietly fall back to a default.
-	dec.KnownFields(true)
-
-	var raw file
-	if err := dec.Decode(&raw); err != nil {
-		if errors.Is(err, io.EOF) {
-			return errors.New("file is empty")
-		}
-		return err
-	}
-	// A second document is an error; a trailing `---` with nothing after it is not.
-	for {
-		var extra yaml.Node
-		err := dec.Decode(&extra)
-		if errors.Is(err, io.EOF) {
-			break
-		}
-		if err != nil {
-			return err
-		}
-		if !blank(&extra) {
-			return errors.New("want a single YAML document")
-		}
-	}
-
-	c.defaults()
-	c.apply(&raw)
-	return c.validate()
-}
-
-// blank reports whether a document is empty, which is what a bare `---` decodes to.
-func blank(n *yaml.Node) bool {
-	if n.Kind == yaml.DocumentNode && len(n.Content) == 1 {
-		n = n.Content[0]
-	}
-	return n.Kind == yaml.ScalarNode && n.Tag == "!!null"
-}
-
-// defaults fills c with the Default column of CONFIG.md.
-func (c *Config) defaults() {
-	*c = Config{
-		Listeners: Listeners{Inbound: "0.0.0.0:15000", Outbound: "127.0.0.1:15001"},
-		App:       App{Address: "127.0.0.1:8080"},
-		Inbound:   Inbound{DefaultTimeout: 3 * time.Second, MaxTimeout: 30 * time.Second},
-		Limits:    Limits{MaxBodyBytes: 10 << 20, MaxHeaderBytes: 64 << 10},
-		Reload:    Reload{Interval: 2 * time.Second},
-		Shutdown:  Shutdown{DrainTimeout: 10 * time.Second},
-		Log:       Log{Level: slog.LevelInfo},
-	}
-	c.Defaults.defaults()
-}
-
-func (p *Policy) defaults() {
-	*p = Policy{
+// DefaultPolicy is the Default column of CONFIG.md for per-service knobs.
+func DefaultPolicy() Policy {
+	return Policy{
 		Timeout: 5 * time.Second,
 		Retry: Retry{
 			MaxAttempts:    3,
@@ -196,4 +94,40 @@ func (p *Policy) defaults() {
 			DecayAfter:          5 * time.Minute,
 		},
 	}
+}
+
+// decode reads exactly one YAML document from r into dst.
+func decode(r io.Reader, dst any) error {
+	dec := yaml.NewDecoder(r)
+	// A typo must fail loudly, not quietly fall back to a default.
+	dec.KnownFields(true)
+
+	if err := dec.Decode(dst); err != nil {
+		if errors.Is(err, io.EOF) {
+			return errors.New("file is empty")
+		}
+		return err
+	}
+	// A second document is an error; a trailing `---` with nothing after it is not.
+	for {
+		var extra yaml.Node
+		err := dec.Decode(&extra)
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if !blank(&extra) {
+			return errors.New("want a single YAML document")
+		}
+	}
+}
+
+// blank reports whether a document is empty, which is what a bare `---` decodes to.
+func blank(n *yaml.Node) bool {
+	if n.Kind == yaml.DocumentNode && len(n.Content) == 1 {
+		n = n.Content[0]
+	}
+	return n.Kind == yaml.ScalarNode && n.Tag == "!!null"
 }

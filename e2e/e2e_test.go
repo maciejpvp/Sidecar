@@ -5,8 +5,6 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
-	"os"
-	"path/filepath"
 	"testing"
 	"time"
 
@@ -289,60 +287,5 @@ func TestNoInstances(t *testing.T) {
 	}
 	if code := res.Header.Get("X-Sidecar-Error"); code != "no_healthy_upstream" {
 		t.Errorf("X-Sidecar-Error = %q, want no_healthy_upstream", code)
-	}
-}
-
-// A broken edit must leave the sidecar serving the last good table.
-func TestHotReloadReroutes(t *testing.T) {
-	b1 := startEcho(t, "service-b#1")
-	b2 := startEcho(t, "service-b#2")
-
-	path := filepath.Join(t.TempDir(), "sidecar.yaml")
-	route := func(addr string) {
-		t.Helper()
-		body := "services:\n  - name: service-b\n    instances: [\"" + addr + "\"]\n"
-		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
-			t.Fatalf("write config: %v", err)
-		}
-	}
-
-	route(b1.Addr)
-	sc, cfg, err := StartSidecarFromConfig("127.0.0.1:0", path, quietLogger())
-	if err != nil {
-		t.Fatalf("start sidecar: %v", err)
-	}
-	t.Cleanup(sc.Close)
-
-	reached := func() string {
-		t.Helper()
-		res, err := Call(sc.Addr, "service-b", "/v1/hello")
-		if err != nil {
-			t.Fatalf("call service-b: %v", err)
-		}
-		got, err := ReadReceived(res)
-		if err != nil {
-			t.Fatal(err)
-		}
-		return got.Service
-	}
-
-	if got := reached(); got != "service-b#1" {
-		t.Fatalf("before reload reached %q, want service-b#1", got)
-	}
-
-	route(b2.Addr)
-	if err := cfg.Reload(); err != nil {
-		t.Fatalf("Reload: %v", err)
-	}
-	if got := reached(); got != "service-b#2" {
-		t.Errorf("after reload reached %q, want service-b#2", got)
-	}
-
-	route("http://" + b1.Addr)
-	if err := cfg.Reload(); err == nil {
-		t.Fatal("Reload accepted an instance with a scheme")
-	}
-	if got := reached(); got != "service-b#2" {
-		t.Errorf("after a rejected reload reached %q, want service-b#2 still", got)
 	}
 }

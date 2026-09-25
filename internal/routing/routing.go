@@ -72,15 +72,21 @@ func (r *Routes) GetService(name string) (*Service, bool) {
 	return s, ok
 }
 
-// Store is the table in effect, replaced whole on reload. The proxy resolves a
-// service once per request, so in-flight requests finish on their original table.
+// Store is the table in effect, replaced whole on every snapshot. The proxy
+// resolves a service once per request, so in-flight requests finish on their
+// original table.
 type Store struct {
 	current atomic.Pointer[Routes]
 }
 
+// NewStore starts with r, or with no table at all when r is nil: a sidecar
+// that has not yet heard from the control plane knows no routes, and must say
+// so rather than claim every service is unknown.
 func NewStore(r *Routes) *Store {
 	s := &Store{}
-	s.current.Store(r)
+	if r != nil {
+		s.current.Store(r)
+	}
 	return s
 }
 
@@ -88,6 +94,15 @@ func (s *Store) Swap(r *Routes) {
 	s.current.Store(r)
 }
 
+// Ready reports whether the store holds a table yet.
+func (s *Store) Ready() bool {
+	return s.current.Load() != nil
+}
+
 func (s *Store) GetService(name string) (*Service, bool) {
-	return s.current.Load().GetService(name)
+	r := s.current.Load()
+	if r == nil {
+		return nil, false
+	}
+	return r.GetService(name)
 }

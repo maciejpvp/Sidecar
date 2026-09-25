@@ -1,43 +1,29 @@
-# Sidecar configuration. Every field is optional except a service's name and
-# instances; anything left out takes the default from docs/CONFIG.md, which is
-# also where each knob is explained.
+# Sidecar startup configuration — optional. Everything has a default except
+# the three identity fields below, and in Kubernetes those come from
+# environment variables (SIDECAR_SERVICE, SIDECAR_ADVERTISE,
+# SIDECAR_CONTROL_PLANE) set by the Downward API, so pods need no file at all.
+# Routes, instances and per-service policy are not here: they come from the
+# control plane (mesh.yaml). Read once at startup. Reference: docs/CONFIG.md.
 #
-#   go run . -config sidecar.yaml
-#
-# The file is hot-reloaded: edits take effect within reload.interval (2s by
-# default), and a broken edit is logged and ignored. Only the fields marked
-# below are honoured today — the rest are parsed and validated, and start
-# working as their features land (docs/TODO.md).
+#   go run ./cmd/controlplane -mesh mesh.yaml &
+#   go run ./cmd/sidecar -config sidecar.yaml
 
-listeners:
-  outbound: "127.0.0.1:15001"    # honoured: where the local app sends its calls
-  inbound: "0.0.0.0:15000"       # not yet: no inbound listener exists
+controlPlane:
+  address: "127.0.0.1:15100"     # where to register and fetch snapshots from
+
+service:
+  name: orders-svc               # what this pod registers as; callers use it in Host
+  advertise: "127.0.0.1:8080"    # where other sidecars reach this instance. Should
+                                 # be this sidecar's inbound port; until inbound
+                                 # exists (docs/TODO.md) it is the app itself.
 
 app:
-  address: "127.0.0.1:8080"      # not yet: used by the inbound listener
+  address: "127.0.0.1:8080"      # the local app; probed before registering
+  healthPath: /healthz           # 2xx/3xx = healthy; "" registers without checking
 
-defaults:
-  timeout: 5s                    # honoured: whole-request budget, all attempts
-  retry:
-    maxAttempts: 3               # honoured: total attempts, 1 disables retries
-
-services:
-  # The local app reaches this one as `Host: orders-svc`, e.g.
-  #   curl -H 'Host: orders-svc' http://127.0.0.1:15001/v1/orders/42
-  - name: orders-svc
-    instances:                   # other sidecars' inbound ports, host:port
-      - "127.0.0.1:15010"
-      - "127.0.0.1:15011"
-      - "127.0.0.1:15012"
-    timeout: 2s
-
-  # Payments are not safe to replay blindly, so this one never retries from the
-  # sidecar even though the default above allows three attempts.
-  - name: payments-svc
-    instances:
-      - "127.0.0.1:15020"
-    retry:
-      maxAttempts: 1
+listeners:
+  outbound: "127.0.0.1:15001"    # where the local app sends its calls
+  admin: "0.0.0.0:15020"         # /healthz, /readyz, /snapshot
 
 log:
   level: debug

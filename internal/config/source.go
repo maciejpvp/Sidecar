@@ -2,7 +2,6 @@ package config
 
 import (
 	"context"
-	"fmt"
 	"log/slog"
 	"os"
 	"slices"
@@ -11,20 +10,24 @@ import (
 	"time"
 )
 
-// Source owns the config file: it keeps the config in effect behind an atomic
-// pointer and reloads it when the file changes. Readers take one snapshot with
-// Current, so a reload never shows them half of one config and half of another.
+// Source owns the mesh file: it keeps the mesh config in effect behind an
+// atomic pointer and reloads it when the file changes. Readers take one
+// snapshot with Current, so a reload never shows them half of one config and
+// half of another.
+//
+// In Kubernetes the file is a mounted ConfigMap. The kubelet updates it by
+// swapping a symlink, which os.Stat follows, so the poll sees the new file.
 type Source struct {
 	path string
 	log  *slog.Logger
 
-	current atomic.Pointer[Config]
+	current atomic.Pointer[Mesh]
 
 	reloading sync.Mutex // serialises reloads, and guards stamp
 	stamp     stamp
 
 	mu   sync.Mutex
-	subs []func(old, next *Config)
+	subs []func(old, next *Mesh)
 
 	tick func(time.Duration) (<-chan time.Time, func())
 }
@@ -43,7 +46,7 @@ func New(path string, opts ...Option) (*Source, error) {
 	}
 
 	s.stamp = statFile(path)
-	next, err := Load(path)
+	next, err := LoadMesh(path)
 	if err != nil {
 		return nil, err
 	}
@@ -52,13 +55,21 @@ func New(path string, opts ...Option) (*Source, error) {
 	return s, nil
 }
 
+// Static is a Source with no file behind it: m never changes, and Watch and
+// Reload do nothing. For a control plane run without a mesh file, and tests.
+func Static(m *Mesh) *Source {
+	s := &Source{log: slog.Default(), tick: newTicker}
+	s.current.Store(m)
+	return s
+}
+
 // Current is the config in effect. It is never modified; a reload replaces it.
-func (s *Source) Current() *Config {
+func (s *Source) Current() *Mesh {
 	return s.current.Load()
 }
 
 // OnChange registers fn to run after every successful reload.
-func (s *Source) OnChange(fn func(old, next *Config)) {
+func (s *Source) OnChange(fn func(old, next *Mesh)) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.subs = append(s.subs, fn)
@@ -66,6 +77,9 @@ func (s *Source) OnChange(fn func(old, next *Config)) {
 
 // Reload reads the file now; on error the previous config stays in effect.
 func (s *Source) Reload() error {
+	if s.path == "" {
+		return nil
+	}
 	s.reloading.Lock()
 	defer s.reloading.Unlock()
 
@@ -77,7 +91,7 @@ func (s *Source) Reload() error {
 // is restart-only, so it is read once.
 func (s *Source) Watch(ctx context.Context) {
 	every := s.Current().Reload.Interval
-	if every <= 0 {
+	if every <= 0 || s.path == "" {
 		return
 	}
 	tick, stop := s.tick(every)
@@ -110,16 +124,10 @@ func (s *Source) reloadIfChanged() {
 func (s *Source) reload() error {
 	old := s.Current()
 
-	next, err := Load(s.path)
+	next, err := LoadMesh(s.path)
 	if err == nil {
 		if changed := next.keepStatic(old); len(changed) > 0 {
-			// Restoring them can break a cross-field rule (the loop guard checks
-			// the inbound address actually in effect), so validate again.
-			if err = next.validate(); err != nil {
-				err = fmt.Errorf("%s: %w", s.path, err)
-			} else {
-				s.log.Warn("config_restart_required", "config", s.path, "fields", changed)
-			}
+			s.log.Warn("config_restart_required", "config", s.path, "fields", changed)
 		}
 	}
 	if err != nil {
@@ -137,25 +145,6 @@ func (s *Source) reload() error {
 		fn(old, next)
 	}
 	return nil
-}
-
-// keepStatic restores the restart-only fields and returns those the file tried to
-// change, so Current never claims a listener the process is not bound to.
-func (c *Config) keepStatic(old *Config) []string {
-	var changed []string
-	keep(&changed, "listeners.inbound", &c.Listeners.Inbound, old.Listeners.Inbound)
-	keep(&changed, "listeners.outbound", &c.Listeners.Outbound, old.Listeners.Outbound)
-	keep(&changed, "app.address", &c.App.Address, old.App.Address)
-	keep(&changed, "limits.maxHeaderBytes", &c.Limits.MaxHeaderBytes, old.Limits.MaxHeaderBytes)
-	keep(&changed, "reload.interval", &c.Reload.Interval, old.Reload.Interval)
-	return changed
-}
-
-func keep[T comparable](changed *[]string, name string, dst *T, old T) {
-	if *dst != old {
-		*changed = append(*changed, name)
-		*dst = old
-	}
 }
 
 // stamp identifies a version of the file. A missing file is the zero stamp, so

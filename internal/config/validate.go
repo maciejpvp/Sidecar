@@ -3,6 +3,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"math"
 	"net"
 	"regexp"
 	"strconv"
@@ -16,80 +17,51 @@ var serviceName = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`)
 // reservedPrefix is kept for the sidecar's own endpoints.
 const reservedPrefix = "_sidecar"
 
-// validate applies CONFIG.md §Validation, reporting every problem at once so an
-// operator does not restart once per mistake.
-func (c *Config) validate() error {
+// ServiceName checks a service name. Names arrive in a Host header, so they
+// must be DNS labels, and the reserved prefix is kept for the sidecar itself.
+func ServiceName(name string) error {
+	switch {
+	case name == "":
+		return errors.New("required")
+	case !serviceName.MatchString(name):
+		return fmt.Errorf("%q must be a DNS label, since the app names the service in Host", name)
+	case strings.HasPrefix(name, reservedPrefix):
+		return fmt.Errorf("%q is reserved for the sidecar's own endpoints", reservedPrefix)
+	}
+	return nil
+}
+
+// Snapshot checks the services a control-plane snapshot carries, with the
+// same rules the control plane applied before sending it. A sidecar runs them
+// again because the two may be different versions, and a snapshot it cannot
+// use must be rejected whole — the last good table keeps serving — rather
+// than half-applied. retry.maxBodyBytes is not held against limits here: that
+// limit is the control plane's, and it has already checked it.
+func Snapshot(services []Service) error {
 	var errs []error
 	add := func(format string, args ...any) {
 		errs = append(errs, fmt.Errorf(format, args...))
 	}
 
-	if err := listenAddr(c.Listeners.Inbound); err != nil {
-		add("listeners.inbound: %w", err)
-	}
-	if err := listenAddr(c.Listeners.Outbound); err != nil {
-		add("listeners.outbound: %w", err)
-	} else if err := loopbackOnly(c.Listeners.Outbound); err != nil {
-		add("listeners.outbound: %w", err)
-	}
-	if err := listenAddr(c.App.Address); err != nil {
-		add("app.address: %w", err)
-	}
-
-	if c.Inbound.DefaultTimeout <= 0 {
-		add("inbound.defaultTimeout: must be positive, got %v", c.Inbound.DefaultTimeout)
-	}
-	if c.Inbound.MaxTimeout <= 0 {
-		add("inbound.maxTimeout: must be positive, got %v", c.Inbound.MaxTimeout)
-	}
-	if c.Inbound.DefaultTimeout > c.Inbound.MaxTimeout {
-		add("inbound.defaultTimeout (%v) must not exceed inbound.maxTimeout (%v), or every request that omits a deadline is clamped below the default",
-			c.Inbound.DefaultTimeout, c.Inbound.MaxTimeout)
-	}
-
-	if c.Limits.MaxBodyBytes <= 0 {
-		add("limits.maxBodyBytes: must be positive, got %d", c.Limits.MaxBodyBytes)
-	}
-	if c.Limits.MaxHeaderBytes <= 0 {
-		add("limits.maxHeaderBytes: must be positive, got %d", c.Limits.MaxHeaderBytes)
-	}
-	if c.Reload.Interval < 0 {
-		add("reload.interval: must not be negative, got %v (0 disables hot reload)", c.Reload.Interval)
-	}
-	if c.Shutdown.DrainTimeout <= 0 {
-		add("shutdown.drainTimeout: must be positive, got %v", c.Shutdown.DrainTimeout)
-	}
-
-	// Checked even when every service overrides it: a broken default is still wrong.
-	errs = append(errs, c.Defaults.validate("defaults", c.Limits)...)
-
-	seen := make(map[string]int, len(c.Services))
-	for i, svc := range c.Services {
+	seen := make(map[string]bool, len(services))
+	for i, svc := range services {
 		at := fmt.Sprintf("services[%d]", i)
 		if svc.Name != "" {
 			at = fmt.Sprintf("services[%d] (%s)", i, svc.Name)
 		}
+		if err := ServiceName(svc.Name); err != nil {
+			add("%s.name: %w", at, err)
+		}
+		if seen[svc.Name] {
+			add("%s.name: %q appears twice", at, svc.Name)
+		}
+		seen[svc.Name] = true
 
-		switch {
-		case svc.Name == "":
-			add("%s.name: required", at)
-		case !serviceName.MatchString(svc.Name):
-			add("%s.name: must be a DNS label, since the app names the service in Host", at)
-		case strings.HasPrefix(svc.Name, reservedPrefix):
-			add("%s.name: %q is reserved for the sidecar's own endpoints", at, reservedPrefix)
-		}
-		if first, dup := seen[svc.Name]; dup && svc.Name != "" {
-			add("%s.name: %q is already used by services[%d]", at, svc.Name, first)
-		} else if svc.Name != "" {
-			seen[svc.Name] = i
-		}
-
-		if len(svc.Instances) == 0 {
-			add("%s.instances: required, at least one", at)
-		}
+		// Zero instances is legal: a service the mesh file names but that has
+		// no live pods answers 503, not 404.
 		listed := make(map[string]bool, len(svc.Instances))
 		for _, inst := range svc.Instances {
-			if err := instanceAddr(inst); err != nil {
+			if err := InstanceAddr(inst); err != nil {
 				add("%s.instances: %q: %w", at, inst, err)
 				continue
 			}
@@ -98,18 +70,13 @@ func (c *Config) validate() error {
 				add("%s.instances: %q is listed twice", at, inst)
 			}
 			listed[inst] = true
-			if inst == c.Listeners.Inbound || sameLoopbackPort(inst, c.Listeners.Inbound) {
-				add("%s.instances: %q is this sidecar's own inbound address, which would route a request back into itself", at, inst)
-			}
 		}
-
-		errs = append(errs, svc.Policy.validate(at, c.Limits)...)
+		errs = append(errs, svc.Policy.validate(at, math.MaxInt64)...)
 	}
-
 	return errors.Join(errs...)
 }
 
-func (p Policy) validate(at string, limits Limits) []error {
+func (p Policy) validate(at string, maxBodyBytes int64) []error {
 	var errs []error
 	add := func(format string, args ...any) {
 		errs = append(errs, fmt.Errorf(format, args...))
@@ -131,9 +98,9 @@ func (p Policy) validate(at string, limits Limits) []error {
 	if p.Retry.MaxBodyBytes < 0 {
 		add("%s.retry.maxBodyBytes: must not be negative, got %d", at, p.Retry.MaxBodyBytes)
 	}
-	if p.Retry.MaxBodyBytes > limits.MaxBodyBytes {
+	if p.Retry.MaxBodyBytes > maxBodyBytes {
 		// Buffering past the hard cap would hold a body about to be rejected with 413.
-		add("%s.retry.maxBodyBytes (%d) must not exceed limits.maxBodyBytes (%d)", at, p.Retry.MaxBodyBytes, limits.MaxBodyBytes)
+		add("%s.retry.maxBodyBytes (%d) must not exceed limits.maxBodyBytes (%d)", at, p.Retry.MaxBodyBytes, maxBodyBytes)
 	}
 	if p.Retry.MinAttemptTime < 0 {
 		add("%s.retry.minAttemptTime: must not be negative, got %v", at, p.Retry.MinAttemptTime)
@@ -178,9 +145,9 @@ func (p Policy) validate(at string, limits Limits) []error {
 	return errs
 }
 
-// instanceAddr checks an upstream address: bare host:port, since v1 dials plain
+// InstanceAddr checks an upstream address: bare host:port, since v1 dials plain
 // HTTP and TLS belongs to the Transport. The host is resolved at connect time.
-func instanceAddr(addr string) error {
+func InstanceAddr(addr string) error {
 	if strings.Contains(addr, "/") {
 		return errors.New("want host:port without a scheme")
 	}
@@ -197,6 +164,19 @@ func instanceAddr(addr string) error {
 	}
 	if n, err := strconv.Atoi(port); err != nil || n < 1 || n > 65535 {
 		return fmt.Errorf("want host:port: port %q is not 1..65535", port)
+	}
+	return nil
+}
+
+// advertiseAddr is an instance address that is also dialable from another
+// host: "every interface" is where a process listens, not somewhere to connect.
+func advertiseAddr(addr string) error {
+	if err := InstanceAddr(addr); err != nil {
+		return err
+	}
+	host, _, _ := net.SplitHostPort(addr)
+	if ip := net.ParseIP(host); ip != nil && ip.IsUnspecified() {
+		return errors.New("an unspecified address (0.0.0.0, ::) cannot be dialled; advertise the pod IP")
 	}
 	return nil
 }

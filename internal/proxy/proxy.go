@@ -18,6 +18,12 @@ type Resolver interface {
 	GetService(name string) (*routing.Service, bool)
 }
 
+// readiness is implemented by a Resolver that can be empty because it has not
+// been filled yet (routing.Store before the first control-plane snapshot).
+type readiness interface {
+	Ready() bool
+}
+
 type Handler struct {
 	routes    Resolver
 	log       *slog.Logger
@@ -60,6 +66,15 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if name == "" {
 		log.Warn("request has no target service")
 		writeError(w, http.StatusBadRequest, "no_route", "no target service in request")
+		return
+	}
+
+	if r, ok := h.routes.(readiness); ok && !r.Ready() {
+		// Every name is unknown before the first snapshot, and a 404 would
+		// tell the app the service does not exist. It is the sidecar that is
+		// not ready, and trying again shortly will work.
+		log.Warn("no routing table yet")
+		writeError(w, http.StatusServiceUnavailable, "mesh_not_ready", "sidecar has no routes from the control plane yet")
 		return
 	}
 

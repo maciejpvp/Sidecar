@@ -4,11 +4,13 @@ Ordered by importance: each tier unblocks the next. Within a tier, top items fir
 Design rationale for every item lives in [DESIGN.md](DESIGN.md) (section refs below); decisions
 already settled are in [QUESTIONS.md](QUESTIONS.md).
 
-Current state: outbound-only proxy on `127.0.0.1:15001`, services addressed by `Host`
-(QUESTIONS D1), service table loaded from `sidecar.yaml` with `host:port` instances (QUESTIONS D2,
-D3), round-robin with retries on a fresh instance, per-service request deadline, JSON error model,
-JSON logger, hot reload of the config file (QUESTIONS D4). End-to-end demo and tests in
-[../e2e](../e2e). No inbound listener, no access log, no graceful shutdown.
+Current state: outbound proxy on `127.0.0.1:15001`, services addressed by `Host` (QUESTIONS D1),
+**routes from a control plane** — sidecars register themselves with leases while their app is
+healthy and long-poll versioned snapshots (DESIGN §13, QUESTIONS D5–D9); per-service policy in the
+control plane's hot-reloaded `mesh.yaml` (D6). Round-robin with retries on a fresh instance,
+per-service request deadline, JSON error model, JSON logger, admin endpoints for Kubernetes probes,
+graceful shutdown that deregisters before draining. Kubernetes manifests in [../deploy](../deploy).
+End-to-end demo and tests in [../e2e](../e2e). No inbound listener, no access log.
 
 ---
 
@@ -42,9 +44,17 @@ JSON logger, hot reload of the config file (QUESTIONS D4). End-to-end demo and t
     `routing.Service` embeds `config.Policy`, so wiring them is a matter of reading
     `svc.Retry.Backoff.Base` and friends in place of the constants.
 
-- [ ] **Package layout + lifecycle** (DESIGN §6.1, §9) — move `main.go` → `cmd/sidecar/` (`-config`
-  already exists), signal handling — and pass that context to `cfg.Watch` instead of `Background` — `http.Server.Shutdown` with a drain timeout.
-  *Done when:* Ctrl+C drains in-flight requests instead of cutting them.
+- [x] **Package layout + lifecycle** (DESIGN §6.1, §9) — `cmd/sidecar` and `cmd/controlplane`,
+  signal handling, deregister → `http.Server.Shutdown` with `shutdown.drainTimeout`.
+  *Done:* Ctrl+C deregisters, then drains in-flight requests instead of cutting them.
+  Still to split out of `internal/proxy`: `balancer`, `resilience`, `errors` (DESIGN §6.1).
+
+- [x] **Control plane + self-registration** (DESIGN §13, QUESTIONS D5–D9) — registry with leases
+  and expiry, versioned long-poll snapshots, warmup after restart, per-service policy from
+  `mesh.yaml`, registration gated on the app's health, `503 mesh_not_ready` before the first
+  snapshot, Kubernetes manifests with native sidecars.
+  *Done:* `e2e.TestScaleOutAndIn`, `TestUnhealthyAppLeavesTheMesh`, `TestControlPlaneRestart`.
+  *Not yet verified on a real cluster* — the manifests have only been parsed, not applied.
 
 - [x] **Per-request timeout** — `service.timeout` → `context.WithTimeout` → 504
   `deadline_exceeded`, covering the response body as well as time to first byte. Full two-header
@@ -88,15 +98,16 @@ JSON logger, hot reload of the config file (QUESTIONS D4). End-to-end demo and t
 - [ ] **Inbound listener + context stamping** (DESIGN §3.2) — `:15000`, request-id and
   `traceparent` generation/validation, deadline clamp, forward to the app. No retries, no LB.
   Unlocks true sidecar→sidecar chains; until this exists, propagation is untestable end to end.
+  Also: sidecars currently advertise the *app's* port, because there is nothing on `:15000`; when
+  this lands, `SIDECAR_ADVERTISE` in `deploy/k8s/example.yaml` becomes `$(POD_IP):15000` and the
+  app can bind loopback only.
 
-- [~] **Hot reload: mtime poll + atomic table swap + state carry-over** (DESIGN §8) — `config.Source`
-  polls, validates and stores; `routing.Store` swaps the table; idle
-  connections are closed after a swap. Invalid files are rejected once and the old table keeps
-  serving; restart-only fields keep their running value (QUESTIONS D4).
-  *Done:* editing YAML changes routing with no restart (`e2e.TestHotReloadReroutes`).
+- [~] **Table swap + state carry-over** (DESIGN §8) — every snapshot is validated and swapped into
+  `routing.Store`; idle connections are closed after a swap; `mesh.yaml` edits reach sidecars with
+  no restart (`e2e.TestPolicyFromMeshFile`).
   Still open: outlier state and budgets carrying over by key — nothing to carry until those
-  features exist, but it must land *with* them, or every reload silently un-ejects every broken
-  instance.
+  features exist, but it must land *with* them, or every snapshot (and snapshots now arrive on
+  every scale event) silently un-ejects every broken instance.
 
 ---
 
@@ -121,6 +132,17 @@ JSON logger, hot reload of the config file (QUESTIONS D4). End-to-end demo and t
 
 ---
 
+## P3½ — Control plane follow-ups (QUESTIONS Q6–Q9)
+
+- [ ] Authenticated registration: ServiceAccount token + TokenReview (Q6).
+- [ ] HA control plane: sidecars heartbeat to every replica behind a headless Service (Q7).
+- [ ] `service.register: false` for client-only workloads (Q8).
+- [ ] Faster deregistration on pod termination (Q9).
+- [ ] Apply `deploy/k8s` on kind in CI, scale `orders-svc` up and down, assert `web` never logs a failure.
+- [ ] Scoped snapshots (a sidecar receives only the services it calls) — only if the mesh grows.
+
+---
+
 ## P4 — Beyond v1 (explicit non-goals today; listed so the seams stay honest)
 
 - [ ] Prometheus metrics + `/stats` admin endpoint (the logs-only decision will start to hurt around P1).
@@ -128,4 +150,4 @@ JSON logger, hot reload of the config file (QUESTIONS D4). End-to-end demo and t
 - [ ] Active health checks, half-open probing, slow-start after un-ejection.
 - [ ] Alternative balancers (least-request, EWMA) behind the `Balancer` interface.
 - [ ] gRPC / HTTP2 as a second `Protocol` implementation.
-- [ ] Circuit breaking (concurrent-request limits), dynamic discovery / control plane, iptables interception.
+- [ ] Circuit breaking (concurrent-request limits), iptables interception.

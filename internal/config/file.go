@@ -10,34 +10,9 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// The YAML shape. Every leaf is a pointer so "not set" differs from "set to zero":
-// that is what lets a service inherit `defaults` field by field while still
-// setting `perTryTimeout: 0s` on purpose.
-type file struct {
-	Listeners fileListeners `yaml:"listeners"`
-	App       fileApp       `yaml:"app"`
-	Inbound   fileInbound   `yaml:"inbound"`
-	Defaults  filePolicy    `yaml:"defaults"`
-	Services  []fileService `yaml:"services"`
-	Limits    fileLimits    `yaml:"limits"`
-	Reload    fileReload    `yaml:"reload"`
-	Shutdown  fileShutdown  `yaml:"shutdown"`
-	Log       fileLog       `yaml:"log"`
-}
-
-type fileListeners struct {
-	Inbound  *string `yaml:"inbound"`
-	Outbound *string `yaml:"outbound"`
-}
-
-type fileApp struct {
-	Address *string `yaml:"address"`
-}
-
-type fileInbound struct {
-	DefaultTimeout *duration `yaml:"defaultTimeout"`
-	MaxTimeout     *duration `yaml:"maxTimeout"`
-}
+// The YAML shapes shared by both files. Every leaf is a pointer so "not set"
+// differs from "set to zero": that is what lets a service inherit `defaults`
+// field by field while still setting `perTryTimeout: 0s` on purpose.
 
 type filePolicy struct {
 	Timeout       *duration   `yaml:"timeout"`
@@ -71,17 +46,6 @@ type fileOutlier struct {
 	MaxEjection         *duration `yaml:"maxEjection"`
 	MaxEjectionPercent  *int      `yaml:"maxEjectionPercent"`
 	DecayAfter          *duration `yaml:"decayAfter"`
-}
-
-type fileService struct {
-	Name       *string  `yaml:"name"`
-	Instances  []string `yaml:"instances"`
-	filePolicy `yaml:",inline"`
-}
-
-type fileLimits struct {
-	MaxBodyBytes   *int64 `yaml:"maxBodyBytes"`
-	MaxHeaderBytes *int   `yaml:"maxHeaderBytes"`
 }
 
 type fileReload struct {
@@ -118,7 +82,11 @@ func (l *level) UnmarshalYAML(n *yaml.Node) error {
 	if n.Kind != yaml.ScalarNode {
 		return errors.New("want one of debug, info, warn, error")
 	}
-	switch strings.ToLower(n.Value) {
+	return l.parse(n.Value)
+}
+
+func (l *level) parse(s string) error {
+	switch strings.ToLower(s) {
 	case "debug":
 		*l = level(slog.LevelDebug)
 	case "info":
@@ -128,35 +96,9 @@ func (l *level) UnmarshalYAML(n *yaml.Node) error {
 	case "error":
 		*l = level(slog.LevelError)
 	default:
-		return fmt.Errorf("%q is not one of debug, info, warn, error", n.Value)
+		return fmt.Errorf("%q is not one of debug, info, warn, error", s)
 	}
 	return nil
-}
-
-// apply layers a parsed file over c.
-func (c *Config) apply(f *file) {
-	set(&c.Listeners.Inbound, f.Listeners.Inbound)
-	set(&c.Listeners.Outbound, f.Listeners.Outbound)
-	set(&c.App.Address, f.App.Address)
-	setDuration(&c.Inbound.DefaultTimeout, f.Inbound.DefaultTimeout)
-	setDuration(&c.Inbound.MaxTimeout, f.Inbound.MaxTimeout)
-	set(&c.Limits.MaxBodyBytes, f.Limits.MaxBodyBytes)
-	set(&c.Limits.MaxHeaderBytes, f.Limits.MaxHeaderBytes)
-	setDuration(&c.Reload.Interval, f.Reload.Interval)
-	setDuration(&c.Shutdown.DrainTimeout, f.Shutdown.DrainTimeout)
-	if f.Log.Level != nil {
-		c.Log.Level = slog.Level(*f.Log.Level)
-	}
-
-	c.Defaults.apply(f.Defaults)
-
-	c.Services = make([]Service, 0, len(f.Services))
-	for _, fs := range f.Services {
-		svc := Service{Instances: fs.Instances, Policy: c.Defaults}
-		set(&svc.Name, fs.Name)
-		svc.Policy.apply(fs.filePolicy)
-		c.Services = append(c.Services, svc)
-	}
 }
 
 func (p *Policy) apply(f filePolicy) {

@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"sidecar/internal/config"
+	"sidecar/internal/controlplane"
 	"sidecar/internal/proxy"
 	"sidecar/internal/routing"
 	"sidecar/internal/sidecar"
@@ -37,8 +38,9 @@ type Echo struct {
 	// Addr is host:port, the form a routing table stores an instance in.
 	Addr string
 
-	requests atomic.Uint64
-	srv      *httptest.Server
+	requests  atomic.Uint64
+	unhealthy atomic.Bool
+	srv       *httptest.Server
 }
 
 func StartEcho(name string) *Echo { return newEcho(name, 0, nil) }
@@ -60,6 +62,14 @@ func StartEchoOn(name, network, bind string) *Echo {
 func newEcho(name string, delay time.Duration, ln net.Listener) *Echo {
 	e := &Echo{Name: name}
 	e.srv = httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// The sidecar's health probe, answered apart so it does not count as
+		// traffic: tests compare request counts across instances.
+		if r.URL.Path == HealthPath {
+			if e.unhealthy.Load() {
+				w.WriteHeader(http.StatusServiceUnavailable)
+			}
+			return
+		}
 		e.requests.Add(1)
 		if delay > 0 {
 			select {
@@ -88,7 +98,14 @@ func newEcho(name string, delay time.Duration, ln net.Listener) *Echo {
 	return e
 }
 
+// HealthPath is where an Echo answers its sidecar's health probe.
+const HealthPath = "/healthz"
+
 func (e *Echo) Requests() uint64 { return e.requests.Load() }
+
+// SetHealthy makes the health probe pass or fail; traffic is served either way,
+// the way an app that is shutting down still finishes what it was sent.
+func (e *Echo) SetHealthy(ok bool) { e.unhealthy.Store(!ok) }
 
 func (e *Echo) Close() { e.srv.Close() }
 
@@ -113,27 +130,119 @@ func StartSidecar(addr string, services []config.Service, log *slog.Logger) (*Si
 	return s, nil
 }
 
-// StartSidecarFromConfig starts a sidecar from a config file with main's wiring,
-// listening on addr rather than listeners.outbound so tests can use any port.
-func StartSidecarFromConfig(addr, path string, log *slog.Logger) (*Sidecar, *config.Source, error) {
-	cfg, err := config.New(path, config.WithLogger(log))
-	if err != nil {
-		return nil, nil, err
-	}
-
-	ln, err := net.Listen("tcp", addr)
-	if err != nil {
-		return nil, nil, fmt.Errorf("bind outbound listener on %s: %w", addr, err)
-	}
-	s := &Sidecar{Addr: ln.Addr().String(), srv: sidecar.Server(cfg, sidecar.Handler(cfg, nil, log))}
-	go s.srv.Serve(ln)
-	return s, cfg, nil
-}
-
 func (s *Sidecar) Close() {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	s.srv.Shutdown(ctx)
+}
+
+// ControlPlane is a control plane on an ephemeral loopback port.
+type ControlPlane struct {
+	Addr   string
+	Server *controlplane.Server
+	Mesh   *config.Source
+
+	srv    *http.Server
+	cancel context.CancelFunc
+}
+
+// StartControlPlane serves mesh with the given warmup; tests pass 0 unless
+// warmup is what they are testing.
+func StartControlPlane(mesh *config.Source, warmup time.Duration, log *slog.Logger) (*ControlPlane, error) {
+	return StartControlPlaneOn("127.0.0.1:0", mesh, warmup, log)
+}
+
+// StartControlPlaneOn is StartControlPlane on a fixed address, so a test can
+// restart one where its sidecars expect it.
+func StartControlPlaneOn(addr string, mesh *config.Source, warmup time.Duration, log *slog.Logger) (*ControlPlane, error) {
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return nil, fmt.Errorf("bind control plane: %w", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	server := controlplane.NewServer(mesh, controlplane.NewRegistry(nil), log, warmup)
+	go server.Run(ctx)
+
+	cp := &ControlPlane{Addr: ln.Addr().String(), Server: server, Mesh: mesh, srv: &http.Server{Handler: server}, cancel: cancel}
+	go cp.srv.Serve(ln)
+	return cp, nil
+}
+
+func (cp *ControlPlane) Close() {
+	cp.cancel()
+	cp.srv.Close() // long-polls are cut, as a crashed control plane would
+}
+
+// MeshSidecar is a complete sidecar as cmd/sidecar runs it — registrar,
+// snapshot watcher, outbound proxy, admin endpoints — on ephemeral ports.
+type MeshSidecar struct {
+	Addr  string // outbound
+	Admin string
+	*sidecar.Sidecar
+
+	outbound, admin *http.Server
+	cancel          context.CancelFunc
+	done            chan struct{}
+}
+
+// StartMeshSidecar runs a sidecar for app, registered as service. There is no
+// inbound listener yet (docs/TODO.md), so the instance it advertises is the
+// app itself, as the Kubernetes manifests in deploy/ do for now.
+func StartMeshSidecar(controlPlaneAddr, service string, app *Echo, log *slog.Logger) (*MeshSidecar, error) {
+	env := map[string]string{
+		config.Env.Service:       service,
+		config.Env.Advertise:     app.Addr,
+		config.Env.ControlPlane:  controlPlaneAddr,
+		config.Env.AppAddress:    app.Addr,
+		config.Env.AppHealthPath: HealthPath,
+	}
+	cfg, err := config.LoadSidecar("", func(k string) string { return env[k] })
+	if err != nil {
+		return nil, err
+	}
+
+	sc := sidecar.New(cfg, log)
+	// Fast enough that tests do not wait on the probe loop.
+	sc.Registrar.Probe = 20 * time.Millisecond
+
+	outLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return nil, fmt.Errorf("bind outbound listener: %w", err)
+	}
+	adminLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		outLn.Close()
+		return nil, fmt.Errorf("bind admin listener: %w", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	m := &MeshSidecar{
+		Addr:     outLn.Addr().String(),
+		Admin:    adminLn.Addr().String(),
+		Sidecar:  sc,
+		outbound: sc.OutboundServer(),
+		admin:    sc.AdminServer(),
+		cancel:   cancel,
+		done:     make(chan struct{}),
+	}
+	go m.outbound.Serve(outLn)
+	go m.admin.Serve(adminLn)
+	go func() {
+		sc.Run(ctx)
+		close(m.done)
+	}()
+	return m, nil
+}
+
+// Close shuts down in cmd/sidecar's order: deregister, then drain. Safe to
+// call twice.
+func (m *MeshSidecar) Close() {
+	m.cancel()
+	<-m.done
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	m.outbound.Shutdown(ctx)
+	m.admin.Shutdown(ctx)
 }
 
 // Call is how an app addresses a service: connect to the local sidecar, name

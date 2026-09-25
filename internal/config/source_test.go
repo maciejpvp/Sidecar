@@ -67,7 +67,7 @@ type testFile struct {
 }
 
 func newTestFile(t *testing.T, body string) *testFile {
-	f := &testFile{t: t, path: filepath.Join(t.TempDir(), "sidecar.yaml")}
+	f := &testFile{t: t, path: filepath.Join(t.TempDir(), "mesh.yaml")}
 	f.write(body)
 	return f
 }
@@ -91,7 +91,7 @@ func (f *testFile) write(body string) {
 }
 
 func withTimeout(d string) string {
-	return fmt.Sprintf("services:\n  - name: orders-svc\n    instances: [\"10.0.0.7:15000\"]\n    timeout: %s\n", d)
+	return fmt.Sprintf("services:\n  - name: orders-svc\n    timeout: %s\n", d)
 }
 
 func newSource(t *testing.T, f *testFile, opts ...Option) (*Source, *events) {
@@ -104,18 +104,18 @@ func newSource(t *testing.T, f *testFile, opts ...Option) (*Source, *events) {
 	return s, ev
 }
 
-func changes(s *Source) func() []*Config {
+func changes(s *Source) func() []*Mesh {
 	var mu sync.Mutex
-	var got []*Config
-	s.OnChange(func(_, next *Config) {
+	var got []*Mesh
+	s.OnChange(func(_, next *Mesh) {
 		mu.Lock()
 		defer mu.Unlock()
 		got = append(got, next)
 	})
-	return func() []*Config {
+	return func() []*Mesh {
 		mu.Lock()
 		defer mu.Unlock()
-		return append([]*Config(nil), got...)
+		return append([]*Mesh(nil), got...)
 	}
 }
 
@@ -143,8 +143,8 @@ func TestReloadSwapsAndNotifies(t *testing.T) {
 	s, _ := newSource(t, f)
 	before := s.Current()
 
-	var gotOld, gotNext *Config
-	s.OnChange(func(old, next *Config) { gotOld, gotNext = old, next })
+	var gotOld, gotNext *Mesh
+	s.OnChange(func(old, next *Mesh) { gotOld, gotNext = old, next })
 
 	f.write(withTimeout("3s"))
 	if err := s.Reload(); err != nil {
@@ -170,7 +170,7 @@ func TestReloadKeepsPreviousOnError(t *testing.T) {
 	}{
 		{name: "invalid file", body: "services:\n  - name: BAD\n"},
 		{name: "not yaml", body: "services: [oops\n"},
-		{name: "instance with a scheme", body: "services:\n  - name: orders-svc\n    instances: [\"http://10.0.0.7:15000\"]\n"},
+		{name: "instances listed by hand", body: "services:\n  - name: orders-svc\n    instances: [\"10.0.0.7:15000\"]\n"},
 	}
 
 	for _, tc := range tests {
@@ -203,7 +203,7 @@ func TestReloadKeepsRestartOnlyFields(t *testing.T) {
 	f := newTestFile(t, withTimeout("2s"))
 	s, ev := newSource(t, f)
 
-	f.write("listeners:\n  outbound: \"127.0.0.1:25001\"\nreload:\n  interval: 1s\n" + withTimeout("3s"))
+	f.write("reload:\n  interval: 1s\n" + withTimeout("3s"))
 	if err := s.Reload(); err != nil {
 		t.Fatalf("Reload: %v", err)
 	}
@@ -212,34 +212,32 @@ func TestReloadKeepsRestartOnlyFields(t *testing.T) {
 	if got := c.Services[0].Timeout; got != 3*time.Second {
 		t.Errorf("timeout = %v, want 3s (reloadable, should apply)", got)
 	}
-	if got := c.Listeners.Outbound; got != "127.0.0.1:15001" {
-		t.Errorf("listeners.outbound = %q, want the running 127.0.0.1:15001", got)
-	}
 	if got := c.Reload.Interval; got != 2*time.Second {
 		t.Errorf("reload.interval = %v, want the running 2s", got)
 	}
-
-	fields := ev.attr("config_restart_required", "fields")
-	for _, want := range []string{"listeners.outbound", "reload.interval"} {
-		if !strings.Contains(fields, want) {
-			t.Errorf("config_restart_required fields = %s, want it to name %s", fields, want)
-		}
+	if fields := ev.attr("config_restart_required", "fields"); !strings.Contains(fields, "reload.interval") {
+		t.Errorf("config_restart_required fields = %s, want it to name reload.interval", fields)
 	}
 }
 
-// The loop guard must check the inbound address in effect, not the one requested.
-func TestReloadRevalidatesAfterKeepingRestartOnlyFields(t *testing.T) {
-	f := newTestFile(t, "listeners:\n  inbound: \"127.0.0.1:15000\"\n"+withTimeout("2s"))
-	s, _ := newSource(t, f)
-
-	f.write(`listeners:
-  inbound: "127.0.0.1:16000"
-services:
-  - name: orders-svc
-    instances: ["127.0.0.1:15000"]
-`)
-	if err := s.Reload(); err == nil || !strings.Contains(err.Error(), "own inbound address") {
-		t.Fatalf("Reload error = %v, want the loop guard against the running inbound address", err)
+func TestStaticSourceNeverReloads(t *testing.T) {
+	m := DefaultMesh()
+	s := Static(m)
+	if err := s.Reload(); err != nil {
+		t.Fatalf("Reload: %v", err)
+	}
+	done := make(chan struct{})
+	go func() {
+		s.Watch(context.Background())
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("Watch kept running with no file to watch")
+	}
+	if s.Current() != m {
+		t.Error("Current changed on a static source")
 	}
 }
 

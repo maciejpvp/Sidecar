@@ -1,0 +1,31 @@
+# Mesh configuration, read by the control plane (go run ./cmd/controlplane).
+# Every sidecar receives the policy below inside its snapshot, together with
+# the instances that registered themselves — so no file anywhere lists an
+# instance. A service not named here still routes, with `defaults`: deploying
+# a new service needs no edit to this file.
+#
+# Hot-reloaded: edits reach every sidecar within reload.interval (2s by
+# default) plus one long-poll round trip; a broken edit is logged and ignored.
+# In Kubernetes this is a ConfigMap (deploy/k8s/controlplane.yaml).
+# Field reference: docs/CONFIG.md.
+
+registry:
+  leaseTTL: 15s                  # an instance that stops heartbeating is dropped after this
+
+defaults:
+  timeout: 5s                    # honoured: whole-request budget, all attempts
+  retry:
+    maxAttempts: 3               # honoured: total attempts, 1 disables retries
+
+services:
+  - name: orders-svc
+    timeout: 2s
+
+  # Payments are not safe to replay blindly, so this one never retries from the
+  # sidecar even though the default above allows three attempts.
+  - name: payments-svc
+    retry:
+      maxAttempts: 1
+
+log:
+  level: info

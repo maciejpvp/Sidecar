@@ -82,14 +82,14 @@ Two forms are refused, both deliberately:
 transport block) rather than coming free with a per-instance `https://`. That is the right shape
 anyway — see Q1.
 
-### D3 — The config file carries the whole schema, even the knobs nothing honours yet
+### D3 — The config files carry the whole schema, even the knobs nothing honours yet
 
-*Status: decided · affects CONFIG.md, `internal/config` · code: `config.Load`*
+*Status: decided · affects CONFIG.md, `internal/config` · code: `config.LoadMesh`, `config.LoadSidecar`*
 
 `internal/config` parses, defaults and validates every field in CONFIG.md — including
-`outlier.*`, `retry.budget.*`, `perTryTimeout`, `inbound.*` and `app.address`, none of which has a
-consumer yet. Only `listeners.outbound`, `limits.maxHeaderBytes`, `log.level`, `reload.interval`, and per-service
-`instances`, `timeout`, `retry.maxAttempts` and `retry.maxBodyBytes` change behaviour today.
+`outlier.*`, `retry.budget.*`, `perTryTimeout` and `inbound.*`, none of which has a consumer yet.
+The honoured set is listed at the top of CONFIG.md. (Since D6 the schema is split across
+`sidecar.yaml` and `mesh.yaml`; the rule applies to both.)
 
 **Why not a subset that grows with the features:** `KnownFields(true)` (validation rule 1, so a
 misspelled `maxAttemps` cannot silently default) means any field the structs do not know is a
@@ -99,7 +99,7 @@ documented form. Parsing the whole schema costs a struct field and a range check
 
 **The cost, and how it is paid:** a knob that validates but does nothing is a trap — an operator
 could set `outlier.consecutiveFailures: 3` and believe ejection is on. So the honoured set is listed
-at the top of CONFIG.md and marked in the committed `sidecar.yaml`, and each TODO item says which
+at the top of CONFIG.md and marked in the committed `mesh.yaml`, and each TODO item says which
 knob it switches on. If that turns out to be too subtle, the next step is a startup warning naming
 configured-but-inert fields.
 
@@ -122,23 +122,113 @@ made that switch first, after a review found the config value was silently ignor
 
 ### D4 — On reload, restart-only fields keep their running value
 
-*Status: decided · affects DESIGN §8, CONFIG.md · code: `config.(*Config).keepStatic`*
+*Status: decided · affects DESIGN §8, CONFIG.md · code: `config.(*Mesh).keepStatic`*
 
-Some fields cannot change in a running process: `listeners.*`, `app.address`,
-`limits.maxHeaderBytes`, `reload.interval`. When a reload changes one, the sidecar applies the rest
-of the file, puts those fields back to their running values, and logs `config_restart_required`
-naming them.
+> Since D6 only `mesh.yaml` is reloaded, and its one restart-only field is `reload.interval`. The
+> sidecar's own file is read once, so listeners and the app address can no longer drift from what
+> the process is bound to. The rule stands for any restart-only field the mesh file grows.
 
-**Why not store the file as written and just warn:** `Current()` would then say the outbound
-listener is `:25102` while the process is bound to `:25101`. Anything reading the config — a
+Some fields cannot change in a running process. When a reload changes one, the process applies the
+rest of the file, puts those fields back to their running values, and logs
+`config_restart_required` naming them.
+
+**Why not store the file as written and just warn:** `Current()` would then say (in the original
+single-file design) the outbound listener is `:25102` while the process is bound to `:25101`. Anything reading the config — a
 future admin endpoint, a log line, the loop guard — would be told something false.
 
 **Why not reject the whole reload:** an operator who changes a timeout and, in the same edit, a
 listener would get *no* timeout change until they restart, which is a surprising way to find out
 a field is restart-only.
 
-The config is re-validated after the restore, because a cross-field rule can depend on a restored
-field: the loop guard checks instances against the inbound address actually in effect.
+(The original design re-validated after the restore, because the loop guard compared instances
+with the restored inbound address. Neither exists in `mesh.yaml`, so that step went with them.)
+
+### D5 — Instances register themselves; the control plane does not watch Kubernetes
+
+*Status: decided · affects DESIGN §13 · code: `internal/controlplane`, `internal/discovery`*
+
+Each sidecar registers its own instance (`service`, `address`, `id`) and renews it with heartbeats;
+a lease that is not renewed expires. This is the Consul/Eureka model.
+
+**The alternative, and it is a strong one:** the control plane watches EndpointSlices, which is
+what Istio and Linkerd do. Kubernetes already knows every pod's IP and readiness, so heartbeats,
+leases and warmup would all go away.
+
+**Why self-registration anyway:**
+
+- The control plane stays platform-independent: the e2e suite runs a real control plane and real
+  sidecars in one process, and the docker-compose demo needs no cluster.
+- Leases, expiry, warmup after restart and versioned snapshots are the distributed-systems part
+  this project exists to build.
+- The local app's own health decides registration (DESIGN §13.4), which is the same signal a
+  readiness probe would give Kubernetes.
+
+**Cost accepted:** a dead pod is routed to until its lease expires (≤ 15 s by default), where
+Kubernetes would drop it from endpoints on the readiness failure. Retries on connection failure,
+and outlier ejection once it lands, cover the gap. A Kubernetes-backed `Registry` remains possible
+behind the same versioned view.
+
+### D6 — Per-service policy lives in the control plane
+
+*Status: decided · affects CONFIG.md, DESIGN §8, §13 · code: `config.Mesh`, `config.Sidecar`*
+
+Timeouts, retries and outlier settings are in `mesh.yaml`, read and hot-reloaded by the control
+plane, and delivered inside every snapshot. The sidecar's own config shrank to what is per-pod
+(identity, listeners, app, control-plane address), which in Kubernetes is environment variables.
+
+**Why:** a policy is a property of the *callee*. With per-sidecar files, two callers of
+`payments-svc` could disagree about whether it may be retried, and changing a timeout meant editing
+every caller's file. It also keeps "zero manual work" honest: a new service needs no file edit at
+all, because an unnamed service gets `defaults`.
+
+**Consequence:** the old static `services:` list is gone rather than kept as a fallback, so there is
+one code path. Tests that want a fixed table build one with `routing.NewTable` directly, as the
+proxy tests and `e2e.StartSidecar` already did.
+
+### D7 — Snapshots are delivered by versioned long-poll
+
+*Status: decided · affects DESIGN §13.3 · code: `controlplane.(*Server).snapshot`, `discovery.Watcher`*
+
+`GET /v1/snapshot?version=V&wait=30s` answers at once when `V` is stale and otherwise waits for a
+change. Chosen over:
+
+- **Piggybacking on the heartbeat** (simplest): changes would take up to a heartbeat interval (5 s)
+  to arrive, which is exactly when a pod has just died.
+- **Server-sent events / a stream** (closest to xDS): a persistent stream needs its own resume
+  protocol and reconnect logic, and gains nothing over long-poll at this scale.
+
+Snapshots are complete, not deltas, and the version carries a per-process epoch so a restarted
+control plane never reuses a version string (DESIGN §13.3).
+
+### D8 — A sidecar with no snapshot runs, but is not ready
+
+*Status: decided · affects DESIGN §9, §13.5 · code: `routing.Store.Ready`, `proxy` (`mesh_not_ready`)*
+
+A sidecar that cannot reach the control plane at startup starts anyway, fails `/readyz`, answers
+outbound calls with `503 mesh_not_ready`, and keeps retrying. It registers its app as soon as it can,
+independently of snapshots.
+
+**Why not exit and let Kubernetes restart it:** crash-looping couples every pod's startup to the
+control plane's, and the backoff Kubernetes applies to a crash loop makes recovery *slower* once the
+control plane is back. **Why not a local fallback file:** it would be a second source of routes that
+drifts from the real one, and a second code path.
+
+**Why 503 and not 404:** before the first snapshot every name is unknown, and `404 no_route` would
+tell the app "this service does not exist". It is the sidecar that is not ready, and a retry soon
+will work.
+
+### D9 — A heartbeat is a full registration, keyed by address, guarded by a process id
+
+*Status: decided · affects DESIGN §13.2 · code: `controlplane.Registry`, `meshapi.Registration`*
+
+- **Idempotent heartbeat = registration**: there is no separate renew call, so a control plane that
+  lost its state is refilled by the heartbeats it was going to receive anyway. No "unknown lease,
+  re-register" handshake to get wrong.
+- **Keyed by address**: an address is one pod. The newest registration of an address wins.
+- **Random id per sidecar process**: pod IPs are reused, and without an id the delayed deregister
+  of a dead pod could remove the live pod that now has its IP.
+- **Warmup = one lease TTL** after a control-plane start: by then every live instance has
+  heartbeated at least twice (every TTL/3). `e2e.TestControlPlaneRestart` fails with warmup 0.
 
 ---
 
@@ -168,6 +258,10 @@ the missing name, not a missing route. Worth a distinct message, perhaps a disti
 
 ### Q5 — Should the port be optional, defaulting to the inbound port?
 
+> Mostly moot since D5: nobody types instance addresses any more, and the sidecar builds its
+> advertised address from `$(POD_IP)` and a port in the manifest.
+
+
 Today `orders-svc` is rejected and `orders-svc:15000` is required. Since every instance is another
 sidecar's inbound listener, and that defaults to `:15000`, the port is the same in nearly every
 entry — so it could default, leaving `instances: ["10.0.0.7", "10.0.0.8"]`.
@@ -178,6 +272,45 @@ than a config error at startup. It also keeps one address string (D2) instead of
 and an expanded form.
 
 *For defaulting it:* less repetition, and the default is genuinely the common case.
+
+### Q6 — How should registration be authenticated?
+
+Today anything that reaches `:15100` can register as any service and receive its traffic. The
+natural fix in Kubernetes: the sidecar sends its projected ServiceAccount token, the control plane
+validates it with TokenReview and checks the pod's labels match the claimed service. That adds
+client-go (or a hand-rolled API call) and RBAC. Outside Kubernetes it needs a different identity
+source, so it should hang off an interface. Same trust boundary as the plain-HTTP data plane
+(DESIGN §10), which is why it waited.
+
+### Q7 — What would a highly available control plane look like?
+
+One replica with in-memory state is a single point of failure for *changes* (existing routes keep
+working, DESIGN §13.5). Options, cheapest first:
+
+1. **Sidecars heartbeat to every replica** (headless Service, resolve all IPs). Each replica then
+   holds the full registry independently, with no replication protocol. Snapshots from different
+   replicas have different epochs, so a sidecar switching replicas re-fetches once — harmless.
+2. **Shared store** (etcd, Redis) with leases in the store.
+3. **Watch Kubernetes instead** (D5's alternative), where the API server is the HA store.
+
+Until then the Deployment uses `strategy: Recreate`, because a rolling update would briefly split
+registrations between two replicas.
+
+### Q8 — Should a sidecar be able to run without registering?
+
+Every sidecar registers, so a pure client (a batch job, a cron) must still serve a health endpoint
+and advertise an address nobody should call. A `service.register: false` switch is small; the open
+part is whether such a pod should still need a service name (for logs, and eventually for Q6's
+authorization).
+
+### Q9 — Should the sidecar notice pod termination directly?
+
+Deregistration on pod shutdown currently hangs on the app's health check failing (DESIGN §13.4),
+because a native sidecar is signalled only *after* the app exits. Apps that fail health on SIGTERM
+close the window; apps that just exit leave up to ~1 s during which callers hit refused connections
+and retry. Alternatives: a `preStop` hook on the app container that calls the sidecar's admin port
+(per-app manifest work, against the zero-manual goal), or watching the pod's own deletion timestamp
+(needs the Kubernetes API).
 
 ### Q4 — Does `Location` rewriting (DESIGN §10) belong in v1?
 

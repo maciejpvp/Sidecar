@@ -150,3 +150,18 @@ func TestStoreSwap(t *testing.T) {
 		t.Errorf("in-flight service picks %s, want its original 10.0.0.1:15000", got.Host)
 	}
 }
+
+func TestEmptyStoreIsNotReady(t *testing.T) {
+	store := NewStore(nil)
+	if store.Ready() {
+		t.Error("a store with no table reports ready")
+	}
+	if _, ok := store.GetService("svc"); ok {
+		t.Error("GetService found a service in a store with no table")
+	}
+
+	store.Swap(NewTable(nil))
+	if !store.Ready() {
+		t.Error("a store holding an empty table is not ready; empty is a valid snapshot")
+	}
+}
