@@ -48,9 +48,9 @@ spec:
     spec:
       containers:
         - name: controlplane
-          image: sidecar:dev
+          image: sidecar-controlplane:dev
           imagePullPolicy: IfNotPresent
-          command: ["/controlplane", "-mesh", "/etc/mesh/mesh.yaml"]
+          args: ["-mesh", "/etc/mesh/mesh.yaml"]
           ports:
             - name: api
               containerPort: 15100

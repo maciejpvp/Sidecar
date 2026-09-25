@@ -3,8 +3,9 @@
 Manifests for a local cluster (kind, minikube, k3d — Kubernetes 1.29+ for native sidecars).
 
 ```bash
-docker build -t sidecar:dev .
-kind load docker-image sidecar:dev            # or: minikube image load sidecar:dev
+docker build --target sidecar      -t sidecar:dev .
+docker build --target controlplane -t sidecar-controlplane:dev .
+kind load docker-image sidecar:dev sidecar-controlplane:dev   # or: minikube image load …
 
 kubectl apply -f deploy/k8s/controlplane.yaml
 kubectl apply -f deploy/k8s/example.yaml

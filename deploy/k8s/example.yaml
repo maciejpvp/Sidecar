@@ -25,7 +25,6 @@ spec:
           image: sidecar:dev
           imagePullPolicy: IfNotPresent
           restartPolicy: Always
-          command: ["/sidecar"]
           env:
             - name: POD_IP
               valueFrom: {fieldRef: {fieldPath: status.podIP}}
@@ -74,7 +73,6 @@ spec:
           image: sidecar:dev
           imagePullPolicy: IfNotPresent
           restartPolicy: Always
-          command: ["/sidecar"]
           env:
             - name: POD_IP
               valueFrom: {fieldRef: {fieldPath: status.podIP}}

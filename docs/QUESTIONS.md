@@ -230,6 +230,23 @@ will work.
 - **Warmup = one lease TTL** after a control-plane start: by then every live instance has
   heartbeated at least twice (every TTL/3). `e2e.TestControlPlaneRestart` fails with warmup 0.
 
+### D10 — Two images from one Dockerfile
+
+*Status: decided · affects `deploy/` · code: `Dockerfile` (targets `sidecar`, `controlplane`)*
+
+The sidecar and the control plane ship as separate images (`sidecar`, `sidecar-controlplane`),
+built as two final stages over one shared build stage, each with its own `ENTRYPOINT`.
+
+**Why not one image with both binaries:** the two roll out on very different schedules. The
+control plane is one Deployment, restarted freely; a new sidecar reaches production only by
+restarting every app pod. A shared tag makes a control-plane-only fix look like a sidecar release,
+and makes it easy to roll both by accident. Separate entrypoints also mean a manifest cannot start
+the wrong binary, and app pods no longer carry a control-plane binary they never run.
+
+**What we give up:** a single tag that guarantees both sides were built from the same commit.
+During a rollout, sidecars and the control plane will run different versions, so any change to
+the `cpapi` protocol has to stay compatible with the previous release on both sides.
+
 ---
 
 ## Open questions
