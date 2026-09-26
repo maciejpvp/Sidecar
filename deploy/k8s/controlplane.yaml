@@ -1,0 +1,87 @@
+# The control plane: one replica, in-memory registry, mesh policy from a
+# ConfigMap. Apply once per cluster; nothing here changes when services are
+# added — they register themselves.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: mesh
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mesh-config
+  namespace: mesh
+data:
+  # Hot-reloaded: `kubectl edit configmap -n mesh mesh-config` reaches every
+  # sidecar within about a minute (the kubelet's ConfigMap sync) plus 2s.
+  mesh.yaml: |
+    registry:
+      leaseTTL: 15s
+    defaults:
+      timeout: 5s
+      retry:
+        maxAttempts: 3
+    services:
+      - name: orders-svc
+        timeout: 2s
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sidecar-controlplane
+  namespace: mesh
+spec:
+  replicas: 1
+  # Recreate, not RollingUpdate: two control planes side by side would each
+  # hold half the registrations (a sidecar's keep-alive connection sticks to
+  # one pod), and the new one could finish warming up without instances that
+  # only ever heartbeated to the old one. See docs/QUESTIONS.md Q7.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: sidecar-controlplane
+  template:
+    metadata:
+      labels:
+        app: sidecar-controlplane
+    spec:
+      containers:
+        - name: controlplane
+          image: sidecar-controlplane:dev
+          imagePullPolicy: IfNotPresent
+          args: ["-mesh", "/etc/mesh/mesh.yaml"]
+          ports:
+            - name: api
+              containerPort: 15100
+          # /healthz, NOT /readyz: during warmup the control plane must be
+          # reachable, because receiving heartbeats is what warmup waits for.
+          # A readiness probe on /readyz would take it out of the Service,
+          # no heartbeat would arrive, and it would warm up to an empty mesh.
+          readinessProbe:
+            httpGet: {path: /healthz, port: api}
+          livenessProbe:
+            httpGet: {path: /healthz, port: api}
+          volumeMounts:
+            - name: mesh-config
+              mountPath: /etc/mesh
+          resources:
+            requests: {cpu: 50m, memory: 32Mi}
+            limits: {memory: 128Mi}
+      volumes:
+        - name: mesh-config
+          configMap:
+            name: mesh-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sidecar-controlplane
+  namespace: mesh
+spec:
+  selector:
+    app: sidecar-controlplane
+  ports:
+    - name: api
+      port: 15100
+      targetPort: api

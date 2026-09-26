@@ -1,0 +1,111 @@
+# Two services in the mesh. Neither names the other anywhere but in the call
+# itself: orders-svc registers itself, and web finds it by name.
+#
+# The sidecar block is identical in every Deployment; only the app port and
+# health path vary. The service name is the pod's `app` label.
+#
+# The sidecar is a native sidecar (an init container with restartPolicy:
+# Always, Kubernetes 1.29+): it starts before the app, so the app's first
+# outbound call already has a sidecar, and it is stopped after the app, so
+# calls the app makes while shutting down still work.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: orders-svc
+spec:
+  replicas: 2
+  selector:
+    matchLabels: {app: orders-svc}
+  template:
+    metadata:
+      labels: {app: orders-svc}
+    spec:
+      initContainers:
+        - name: sidecar
+          image: sidecar:dev
+          imagePullPolicy: IfNotPresent
+          restartPolicy: Always
+          env:
+            - name: POD_IP
+              valueFrom: {fieldRef: {fieldPath: status.podIP}}
+            - name: SIDECAR_SERVICE
+              valueFrom: {fieldRef: {fieldPath: "metadata.labels['app']"}}
+            # Should be $(POD_IP):15000, the sidecar's inbound listener. Until
+            # that exists (docs/TODO.md) callers reach the app directly.
+            - name: SIDECAR_ADVERTISE
+              value: "$(POD_IP):5678"
+            - name: SIDECAR_CONTROL_PLANE
+              value: "sidecar-controlplane.mesh.svc.cluster.local:15100"
+            - name: SIDECAR_APP_ADDRESS
+              value: "127.0.0.1:5678"
+            - name: SIDECAR_APP_HEALTH_PATH
+              value: "/"
+          ports:
+            - {name: admin, containerPort: 15020}
+          readinessProbe:
+            httpGet: {path: /readyz, port: admin}
+          livenessProbe:
+            httpGet: {path: /healthz, port: admin}
+          resources:
+            requests: {cpu: 10m, memory: 16Mi}
+            limits: {memory: 64Mi}
+      containers:
+        - name: app
+          image: hashicorp/http-echo:1.0
+          args: ["-listen=:5678", "-text=hello from orders-svc"]
+          ports:
+            - containerPort: 5678
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: web}
+  template:
+    metadata:
+      labels: {app: web}
+    spec:
+      initContainers:
+        - name: sidecar
+          image: sidecar:dev
+          imagePullPolicy: IfNotPresent
+          restartPolicy: Always
+          env:
+            - name: POD_IP
+              valueFrom: {fieldRef: {fieldPath: status.podIP}}
+            - name: SIDECAR_SERVICE
+              valueFrom: {fieldRef: {fieldPath: "metadata.labels['app']"}}
+            - name: SIDECAR_ADVERTISE
+              value: "$(POD_IP):8080"
+            - name: SIDECAR_CONTROL_PLANE
+              value: "sidecar-controlplane.mesh.svc.cluster.local:15100"
+            - name: SIDECAR_APP_ADDRESS
+              value: "127.0.0.1:8080"
+            - name: SIDECAR_APP_HEALTH_PATH
+              value: "/healthz"
+          ports:
+            - {name: admin, containerPort: 15020}
+          readinessProbe:
+            httpGet: {path: /readyz, port: admin}
+          livenessProbe:
+            httpGet: {path: /healthz, port: admin}
+          resources:
+            requests: {cpu: 10m, memory: 16Mi}
+            limits: {memory: 64Mi}
+      containers:
+        # A toy caller: serves a health file, and calls orders-svc by name
+        # every two seconds through the sidecar (http_proxy).
+        - name: app
+          image: busybox:1.36
+          env:
+            - name: http_proxy
+              value: "http://127.0.0.1:15001"
+          command:
+            - sh
+            - -c
+            - |
+              mkdir -p /www && echo ok > /www/healthz && httpd -p 8080 -h /www
+              while true; do wget -qO- http://orders-svc/ || echo "call failed"; sleep 2; done

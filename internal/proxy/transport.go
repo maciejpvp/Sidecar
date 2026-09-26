@@ -41,7 +41,7 @@ type attemptTripper struct {
 func (t *attemptTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 	// A lap resets tried, and there are only MaxAttempts picks, so it never
 	// holds more than this many entries.
-	tried := make([]*url.URL, 0, min(t.svc.MaxAttempts, t.svc.InstanceCount()))
+	tried := make([]*url.URL, 0, min(t.svc.Retry.MaxAttempts, t.svc.InstanceCount()))
 
 	for attempt := 1; ; attempt++ {
 		// Every instance has had a turn, so start a fresh lap. Spreading
@@ -70,7 +70,7 @@ func (t *attemptTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 		}
 
 		delay := backoff(attempt)
-		if attempt >= t.svc.MaxAttempts || !hasTimeFor(req.Context(), delay) {
+		if attempt >= t.svc.Retry.MaxAttempts || !hasTimeFor(req.Context(), delay) {
 			return res, err
 		}
 

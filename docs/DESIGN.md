@@ -15,6 +15,10 @@ The sidecar is a small process that runs next to every service instance and hand
   `Host` header (or as an absolute URI, the way any HTTP proxy is addressed); the sidecar resolves
   that name to a set of instances, load-balances, enforces deadlines, retries safely and
   ejects unhealthy instances.
+- **Discovery (control plane)**: every sidecar registers its own instance with the control plane
+  while its app is healthy, renews it with heartbeats, and long-polls the control plane for a
+  snapshot of every service's instances and policy. Nothing is configured per service or per
+  instance by hand (§13).
 - **Inbound (minimal pass-through)**: other services reach this app through the sidecar's
   public port `:15000`; the sidecar stamps request context (request id, trace, deadline),
   forwards to the app on `127.0.0.1:8080` and writes an access log.
@@ -24,7 +28,7 @@ The sidecar is a small process that runs next to every service instance and hand
 | # | Goal |
 |---|------|
 | G1 | Explicit HTTP/1.1 proxy, services addressed by `Host` (see [QUESTIONS.md](QUESTIONS.md) D1) |
-| G2 | Static YAML service discovery with safe hot reload |
+| G2 | Dynamic discovery: self-registration with leases, versioned snapshots from a control plane, zero manual config per service (§13) |
 | G3 | Round-robin load balancing over healthy instances |
 | G4 | Per-instance outlier ejection |
 | G5 | Safe retries (idempotent only) protected by a retry budget |
@@ -39,7 +43,8 @@ The sidecar is a small process that runs next to every service instance and hand
 - Transparent interception (iptables), raw TCP, gRPC/HTTP2, messaging.
 - TLS / mTLS (a `Transport` seam is reserved for it).
 - Prometheus metrics, OpenTelemetry export, admin API (logs only).
-- Dynamic discovery (Kubernetes, Consul) or a control plane.
+- Watching the Kubernetes API, a highly available or persistent control plane, authenticated
+  registration (§13.8).
 - Inbound auth, rate limiting, request/response transformation.
 - Correlating an inbound request with the app's outbound calls (impossible without app help — see §4).
 
@@ -58,7 +63,7 @@ flowchart LR
             LB["Balancer<br/>(round-robin)"]
             RES["Resilience chain<br/>deadline · retry · budget · outlier"]
             TR["Transport<br/>(http.Transport)"]
-            CW["Config watcher<br/>(mtime poll)"]
+            DISC["Discovery<br/>registrar · snapshot watcher"]
             LOG["Access log (slog JSON)"]
         end
     end
@@ -69,7 +74,8 @@ flowchart LR
     OUT --> RT --> RES --> LB --> TR
     TR -->|HTTP| B1["orders-svc #1<br/>sidecar :15000"]
     TR -->|HTTP| B2["orders-svc #2<br/>sidecar :15000"]
-    CW -.->|swap table| RT
+    DISC -.->|swap table| RT
+    DISC <-.->|"heartbeat · long-poll"| CP["Control plane<br/>registry + mesh.yaml"]
     IN -.-> LOG
     OUT -.-> LOG
 ```
@@ -84,6 +90,7 @@ consistent across the mesh.
 |---|---|---|---|
 | inbound | `0.0.0.0:15000` | other sidecars | public entry to this app |
 | outbound | `127.0.0.1:15001` | local app only | app's gateway to other services |
+| admin | `0.0.0.0:15020` | kubelet, operators | `/healthz`, `/readyz`, `/snapshot` |
 | app | `127.0.0.1:8080` | inbound listener | the real service (must bind localhost only) |
 
 The outbound listener **must** bind to loopback — otherwise anyone on the network could use
@@ -352,7 +359,7 @@ type Instance struct {
     // config (decision D2 in QUESTIONS.md). One canonical string means the
     // config file, the access log and the outlier key never disagree.
     Addr    string            // "10.0.0.7:15000"
-    Outlier *OutlierState     // carried over across reloads (see §8)
+    Outlier *OutlierState     // carried over across snapshots (see §8)
 }
 
 type Balancer interface {
@@ -375,10 +382,15 @@ type Transport interface {
     RoundTrip(*http.Request) (*http.Response, error)
 }
 
-// ConfigSource produces validated configs; v1 = file poller.
-type ConfigSource interface {
-    Watch(ctx context.Context) <-chan *config.Config
-}
+// Sidecar side: startup config once, then everything else from the control plane (§13).
+cfg, err := config.LoadSidecar(path, os.Getenv) // file optional, SIDECAR_* env wins; error -> exit 1
+sc := sidecar.New(cfg, log)                     // routes start empty: 503 mesh_not_ready
+sc.Run(ctx)                                     // registrar + watcher; returns after deregistering
+
+// Control-plane side: config.Source owns mesh.yaml: load, validate, store, poll, swap (§8).
+mesh, err := config.New(path)                   // first load; error -> exit 1
+mesh.Current() *config.Mesh                     // immutable snapshot, read once per use
+mesh.OnChange(func(old, next *config.Mesh))     // runs after a reload is committed
 
 type AttemptResult struct {
     Status      int
@@ -391,18 +403,26 @@ type AttemptResult struct {
 ### 6.1 Package layout
 
 ```
-cmd/sidecar/            main: flags, load config, start listeners, signal handling
-internal/config/        YAML structs, defaults, validation, file poller (ConfigSource)
+cmd/sidecar/            main: flags, load config, start listeners, signal handling, deregister-then-drain
+cmd/controlplane/       main: load mesh.yaml, serve the registry API, expire leases
+internal/config/        both files: YAML structs, defaults, validation, config.Source (mesh poll + swap),
+                        and the snapshot rules a sidecar re-checks
+internal/meshapi/       the sidecar ↔ control plane wire types and paths
+internal/controlplane/  registry (leases, versions, wake-ups) and its HTTP server
+internal/discovery/     sidecar side: control-plane client, registrar, snapshot watcher
 internal/routing/       RoutingTable build from config, state carry-over
 internal/balancer/      round-robin
 internal/resilience/    deadline, retry policy, retry budget, outlier detector
 internal/proxy/http/    HTTP Protocol: outbound handler, inbound handler, header utils
 internal/errors/        sidecar error codes + JSON writer
 internal/logging/       slog setup, access log helper
+internal/sidecar/       wiring: discovery -> routing store -> proxy, admin endpoints;
+                        shared by main and the e2e harness so tests exercise what ships
 docs/                   this documentation
 ```
 
-The existing root `main.go` moves to `cmd/sidecar/main.go` in M1.
+`internal/balancer`, `internal/resilience` and `internal/errors` do not exist yet; that code lives
+in `internal/proxy` until the features that need the split land.
 
 ---
 
@@ -423,6 +443,7 @@ X-Request-Id: 7f3a...
 | Code | Status | When |
 |---|---|---|
 | `no_route` | 404 | `Host` names no service in the table (empty `Host` → `400`) |
+| `mesh_not_ready` | 503 | no snapshot from the control plane yet, so no name can be resolved (§13.5) |
 | `no_healthy_upstream` | 503 | balancer returned nil |
 | `upstream_connect_failed` | 502 | last attempt couldn't connect, no response to return |
 | `deadline_exceeded` | 504 | deadline passed before or during attempts |
@@ -437,18 +458,39 @@ error. Sidecar errors only happen when there is nothing better to return.
 
 ## 8. Configuration & hot reload
 
-Config file format: see [CONFIG.md](CONFIG.md).
+Config file formats: see [CONFIG.md](CONFIG.md). There are two files, owned by two processes:
 
-- A goroutine `stat`s the file every `reload.interval` (default 2 s). On mtime or size change it
-  reads, parses, applies defaults and **validates** (§CONFIG validation rules).
-- **Invalid** → log `config_rejected` with the error, keep serving the old table.
-- **Valid** → build a new `RoutingTable` and `Store` it in the `atomic.Pointer`. Requests
-  already running keep using their snapshot, so no request sees a half-updated table.
+| File | Read by | Holds | Changes |
+|---|---|---|---|
+| `sidecar.yaml` (optional) | each sidecar | listeners, local app, control-plane address, own identity | at startup only; in Kubernetes it is environment variables and no file |
+| `mesh.yaml` | the control plane | per-service policy, lease TTL | hot-reloaded, delivered in snapshots |
+
+Instances are in neither: they register themselves (§13).
+
+**`mesh.yaml` hot reload** (the machinery the old per-sidecar file had, moved to the control plane):
+
+- `config.Source.Watch` `stat`s the file every `reload.interval` (default 2 s). On mtime or size
+  change it reads, parses, applies defaults and **validates**. In Kubernetes the file is a mounted
+  ConfigMap, updated by a symlink swap that `os.Stat` follows.
+- The mtime/size stamp moves on **every** change seen, good or bad, so a broken file is rejected
+  and logged once, not every tick. A missing file (an editor saving by rename) is one more change.
+- **Invalid** → log `config_rejected` with the error, keep serving the old policy.
+- **Valid** → the new `*Mesh` is stored, the registry version is bumped (`mesh_policy_changed`),
+  and every sidecar's pending long-poll returns the new snapshot within milliseconds.
+- `reload.interval` is **not** hot-reloadable. A reload that changes it still applies everything
+  else, but it keeps its running value and `config_restart_required` names it (QUESTIONS D4).
+
+**Applying a snapshot** (sidecar side):
+
+- The snapshot is validated again with the same rules (`config.Snapshot`): the sidecar and control
+  plane may be different versions. **Invalid** → `snapshot_rejected`, keep the old table, and do not
+  fetch that version again. **Valid** → `routing.NewTable`, swapped into `routing.Store` (an
+  `atomic.Pointer`). Requests already running keep using their snapshot, so no request sees a
+  half-updated table.
 - **State carry-over**: outlier state and retry budgets are looked up by key
   (`service` for budgets, `service|addr` for instances) in the old table and reused. Removed
   instances drop their state; new instances start healthy. Round-robin counters reset (harmless).
-- Listener addresses and the app address are **not** hot-reloadable (logged as a warning if changed;
-  restart required).
+  *(Not implemented yet — nothing to carry until those features exist.)*
 - Connections to removed instances are closed by `Transport.CloseIdleConnections()` after the swap;
   in-flight requests to them complete normally.
 
@@ -456,11 +498,20 @@ Config file format: see [CONFIG.md](CONFIG.md).
 
 ## 9. Lifecycle
 
-- **Startup**: load + validate config (invalid → exit 1). Bind listeners. Start watcher. Log `ready`.
-- **Shutdown** on SIGINT/SIGTERM (Ctrl+C on Windows): stop accepting, `http.Server.Shutdown` with
-  `shutdown.drainTimeout` (default 10 s) on both listeners in parallel, then force close.
-  Inbound should drain **after** the app has stopped receiving new work, and outbound should stay up
-  until the app finishes. v1 simplification: drain both together, outbound given the drain timeout + 5 s.
+- **Startup (sidecar)**: load + validate config (invalid → exit 1). Bind outbound and admin
+  listeners (failure → exit 1). Start the watcher and the registrar. Log `ready`. Until the first
+  snapshot, `/readyz` is 503 and outbound calls get `503 mesh_not_ready`; the registrar registers as
+  soon as the app's health check passes, independently of snapshots.
+- **Shutdown (sidecar)** on SIGINT/SIGTERM: `shutdown_started` → **deregister first** (callers stop
+  picking this instance) → `http.Server.Shutdown` with `shutdown.drainTimeout` on both listeners →
+  `shutdown_complete`. Outbound keeps serving throughout the drain, because the app may still be
+  finishing requests that call out.
+- **In Kubernetes** the sidecar is a native sidecar (init container, `restartPolicy: Always`): it
+  starts before the app and is stopped after it. So by the time it is signalled the app has usually
+  gone, and the registrar has already deregistered it on the failed health probe (§13.4).
+- **Control plane**: load `mesh.yaml` (invalid → exit 1), serve, expire leases once a second. On
+  SIGTERM, heartbeats get a second to finish and long-polls are cut; sidecars reconnect and keep
+  their tables.
 
 ---
 
@@ -471,7 +522,8 @@ Config file format: see [CONFIG.md](CONFIG.md).
   (`http://orders-svc/v1/x`), which under Host addressing (§3.1) leaves the path alone.
 - **Streaming**: large/chunked bodies are not retried; response streaming (SSE) works but a per-attempt
   timeout only covers time to first byte headers, not the whole body.
-- **No active health checks**, no half-open probing, no slow-start after un-ejection.
+- **No active health checks between sidecars**, no half-open probing, no slow-start after
+  un-ejection. (The *local* app is health-checked, but only to decide registration.)
 - **Logs only** — no metrics; debugging ejections relies on `instance_ejected` / `instance_restored` log events.
 - **Plain HTTP** — any process on the network can call inbound; not safe outside a trusted network.
 - **Clock jumps** on the local host affect `X-Sidecar-Deadline` (use monotonic time internally; the header is only an interchange format).
@@ -486,8 +538,14 @@ One JSON line per request (slog `JSONHandler`):
 {"time":"2026-09-13T10:00:00.123Z","level":"INFO","msg":"access","dir":"outbound","requestId":"7f3a…","traceId":"4bf9…","method":"GET","service":"orders-svc","path":"/v1/orders/42","status":200,"attempts":2,"instances":["10.0.0.7:15000","10.0.0.8:15000"],"durationMs":184,"deadlineMs":2600,"sidecarError":""}
 ```
 
-Event logs: `config_loaded`, `config_rejected`, `instance_ejected`, `instance_restored`,
+Event logs, sidecar: `config_rejected`, `ready`, `waiting_for_app`, `registered`, `app_unhealthy`,
+`deregistered`, `heartbeat_failed`, `deregister_failed`, `snapshot_applied`, `snapshot_rejected`,
+`snapshot_fetch_failed`, `control_plane_reachable`, `instance_ejected`, `instance_restored`,
 `retry_budget_exhausted`, `shutdown_started`, `shutdown_complete`.
+
+Event logs, control plane: `config_loaded`, `config_rejected`, `config_restart_required`,
+`mesh_policy_changed`, `instance_registered`, `instance_replaced`, `instance_renewed` (debug),
+`instance_deregistered`, `instance_expired`, `shutdown_started`, `shutdown_complete`.
 
 ---
 
@@ -500,7 +558,137 @@ Event logs: `config_loaded`, `config_rejected`, `instance_ejected`, `instance_re
 | M3 | Multiple instances, round-robin, outlier ejection with max %, state carry-over | killing one of 3 echo servers → it gets ejected after 5 failures, traffic continues |
 | M4 | Deadlines (both headers), retries with eligibility rules, body buffering, budget, backoff | table-driven tests with fake clock + `httptest` servers cover every row of §5.1/§5.2 |
 | M5 | Inbound listener: context stamping, app forwarding, access logs everywhere, graceful shutdown | request id and deadline observed shrinking across a 3-service chain |
+| M5½ | Control plane: self-registration with leases, long-poll snapshots, central policy, Kubernetes manifests (§13) | pods scale in and out with no config edit; a control-plane restart drops no route (`e2e.TestControlPlaneRestart`) |
 | M6 | `docker-compose` demo: 3 toy services (A→B→C) each with a sidecar + chaos flags on C (latency, error rate) | README walkthrough reproduces retries, ejection and deadline propagation |
 
 Testing approach: `httptest.Server` upstreams, injectable `Clock`, `-race` on everything,
 one end-to-end test that spins up two sidecars in-process.
+
+---
+
+## 13. Control plane
+
+The control plane replaces the static per-sidecar service list. Goal: **zero manual work** — a
+Deployment that carries the sidecar block joins the mesh when its pods become healthy and leaves it
+when they go away, and nobody edits a list of services or instances anywhere.
+
+```mermaid
+sequenceDiagram
+    participant App as orders-svc app
+    participant SB as Sidecar (orders-svc pod)
+    participant CP as Control plane
+    participant SA as Sidecar (web pod)
+
+    SB->>App: GET /healthz (every 1s)
+    App-->>SB: 200
+    SB->>CP: POST /v1/heartbeat {service, address, id}
+    CP-->>SB: lease {ttl 15s, heartbeat 5s}
+    Note over CP: version v1 → v2, wake long-polls
+    SA->>CP: GET /v1/snapshot?version=v1&wait=30s (held open)
+    CP-->>SA: 200 {version v2, services:[orders-svc: [10.1.2.3:5678], policy]}
+    SA->>SA: validate, swap routing table
+    loop every 5s
+        SB->>CP: POST /v1/heartbeat (same body)
+    end
+    Note over SB: SIGTERM or app unhealthy
+    SB->>CP: POST /v1/deregister
+    CP-->>SA: 200 {version v3, orders-svc: []}
+```
+
+### 13.1 Where each piece of information comes from
+
+| Information | Source | Manual? |
+|---|---|---|
+| This pod's service name | pod label `app`, via the Downward API → `SIDECAR_SERVICE` | no (it is the label the Deployment already has) |
+| This pod's address | `status.podIP` via the Downward API → `SIDECAR_ADVERTISE` | no |
+| Whether this pod should get traffic | the sidecar's health probe of its own app | no |
+| Which instances a service has | registrations in the control plane | no |
+| Timeouts, retries, outlier settings | `mesh.yaml` (a ConfigMap) — `defaults` for any service it does not name | only to *override* defaults |
+
+### 13.2 Registration: self-registration with leases (QUESTIONS D5, D9)
+
+- A **heartbeat is a full registration** (`service`, `address`, `id`), idempotent. There is no
+  separate "renew" call, so a control plane that restarted with an empty registry is refilled by the
+  heartbeats it was going to get anyway.
+- The lease TTL is `registry.leaseTTL` (default 15 s); the control plane tells sidecars to heartbeat
+  every TTL/3, so one lost heartbeat is not an expiry. Expired leases are dropped once a second
+  (`instance_expired`) — that is the path for pods that die without saying goodbye (OOM kill, node
+  loss). Until then, callers retry around the dead instance (connection refused is retriable for
+  every method) and, once it exists, outlier ejection stops picking it.
+- The registry is **keyed by address**, since an address is one pod. Pod IPs are reused, so every
+  sidecar process has a random `id`: a new registration of an address replaces the old one
+  (`instance_replaced`), and a late deregistration from the pod that *used* to hold the address is
+  ignored because its `id` no longer matches.
+- Heartbeat failures are retried with backoff (1 s → 5 s); the lease stays valid meanwhile.
+- Renewals do not change the snapshot version; only changes a sidecar can see do.
+
+### 13.3 Snapshots: versioned long-poll (QUESTIONS D7)
+
+`GET /v1/snapshot?version=V&wait=30s`: if the current version differs from `V`, answer at once;
+otherwise hold the request until the version changes (answer with the new snapshot) or `wait` runs
+out (`304`). Updates reach every sidecar within milliseconds, over plain HTTP that curl can drive.
+
+- A snapshot is **the whole mesh**: every service with its instances (sorted) and its resolved
+  policy. At this project's scale that is simpler than deltas and makes each snapshot
+  self-contained.
+- The version is `<epoch>-<counter>`, the epoch random per control-plane process, so a restarted
+  control plane can never hand out a version string an old sidecar already holds for different
+  content.
+- A service `mesh.yaml` names is in every snapshot, even with no instances (callers get
+  `503 no_healthy_upstream`: it exists but is down). A service it does not name is in the snapshot
+  while something is registered for it, with `defaults` (callers get `404 no_route` when it is gone).
+- The sidecar validates the snapshot again before applying it; a bad one is rejected whole.
+
+### 13.4 The local app decides registration
+
+The registrar probes `app.address` + `app.healthPath` every second (2xx/3xx = healthy):
+
+- **Not yet healthy** → do not register (`waiting_for_app`). No traffic before the app can serve.
+- **Healthy** → heartbeat on the lease schedule.
+- **Healthy → unhealthy** → deregister at once (`app_unhealthy`), register again on recovery.
+- **SIGTERM** → deregister, then drain (§9).
+
+The deregistration window on pod shutdown is therefore about one probe interval plus one long-poll
+round trip. Apps that fail their health endpoint as soon as they get SIGTERM, and keep serving for
+a few seconds (the usual Kubernetes graceful-shutdown pattern), close it completely.
+
+### 13.5 Failure modes
+
+| What fails | What happens |
+|---|---|
+| Control plane unreachable | Sidecars keep routing on their last table indefinitely (`snapshot_fetch_failed` once, then debug), and keep retrying with backoff (250 ms → 10 s). Registrations stay valid until TTL, and nobody can expire them, since expiry is also the control plane. |
+| Control plane restarts | Empty registry. For one lease TTL (**warmup**) it accepts heartbeats but answers snapshots with `503 warming_up` + `Retry-After`, so no sidecar is handed an empty mesh. After one TTL every live instance has heartbeated at least twice. `e2e.TestControlPlaneRestart` fails if warmup is 0. |
+| Sidecar starts while the control plane is down | Starts anyway, `/readyz` 503, outbound `503 mesh_not_ready` (not `404`: the name is not unknown, the sidecar is not ready). Registers as soon as it can. |
+| Pod killed without deregistering | Stays in snapshots until its lease expires (≤ 15 s); callers retry past it meanwhile. |
+| Bad snapshot (version skew, bug) | Rejected whole by the sidecar, last good table kept, `snapshot_rejected`. |
+| Bad `mesh.yaml` edit | Rejected by the control plane, last good policy kept, `config_rejected`. |
+
+### 13.6 Kubernetes shape (`deploy/k8s/`)
+
+- **Control plane**: one replica, `strategy: Recreate`, a Service on `:15100`, `mesh.yaml` from a
+  ConfigMap. Its readiness probe is `/healthz`, **not** `/readyz`: during warmup it must stay in
+  the Service, because heartbeats are what warmup is waiting for.
+- **Sidecar**: a native sidecar (init container with `restartPolicy: Always`) — started before the
+  app, stopped after it. Identity from the Downward API; readiness `/readyz` on the admin port.
+  The app reaches the mesh with `http_proxy=http://127.0.0.1:15001`.
+- No RBAC: nothing talks to the Kubernetes API.
+
+### 13.7 Why not watch the Kubernetes API?
+
+It is what Istio and Linkerd do, and Kubernetes already knows every pod's IP and readiness. It was
+the main alternative (QUESTIONS D5). Self-registration was chosen because it keeps the control plane
+platform-independent — the e2e tests and the docker-compose demo run without a cluster — and
+because leases, warmup and versioned snapshots are the interesting part to build. The seam for
+the other choice is the `Registry`: a Kubernetes-backed one would fill the same versioned view
+from EndpointSlices.
+
+### 13.8 Not handled (yet)
+
+- **Authentication**: anyone who can reach `:15100` can register as any service and receive its
+  traffic. The fix is a Kubernetes projected ServiceAccount token checked with TokenReview
+  (QUESTIONS Q6). Acceptable for a trusted cluster network, same as plain HTTP (§10).
+- **One control-plane replica, in memory**: see QUESTIONS Q7.
+- **Client-only workloads**: every sidecar registers, so a pod that only makes calls still needs a
+  health endpoint and an address (QUESTIONS Q8).
+- **Snapshot size**: every sidecar gets every service. Fine for tens of services; past that,
+  sidecars would declare what they call and receive only that.

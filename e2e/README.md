@@ -63,11 +63,24 @@ the tests needs to change.
 | `TestSlowButWithinBudget` | a slow upstream that still answers in time is not cut off |
 | `TestNoInstances` | a service with an empty instance list → 503 `no_healthy_upstream`, not 404 |
 
-Not covered, because none of it exists yet: deadline propagation between hops, retries, outlier
-ejection, retry budgets, inbound context stamping, hot reload. Those are P1 in
+With a control plane (`discovery_test.go`: an in-process control plane, and full sidecars that
+register their echo app and long-poll for snapshots — the wiring `cmd/sidecar` runs):
+
+| Test | What it pins down |
+|---|---|
+| `TestDiscoveredRoute` | nothing lists service-b anywhere; A reaches it once B's sidecar registers; A's `/readyz` goes 200 |
+| `TestScaleOutAndIn` | a second instance is picked up, and a gracefully stopped one leaves every table at once |
+| `TestUnhealthyAppLeavesTheMesh` | an app failing its health check is deregistered, and returns when it recovers |
+| `TestDeclaredServiceWithNoInstances` | a service `mesh.yaml` names but nobody runs → 503, not 404 |
+| `TestPolicyFromMeshFile` | per-service timeout comes from the control plane's file, and an edit applies with no restart |
+| `TestNotReadyBeforeFirstSnapshot` | before any snapshot: 503 `mesh_not_ready`, `/readyz` 503, `/healthz` 200, registration proceeds |
+| `TestControlPlaneRestart` | routes survive the control plane going down; a restarted one warms up before serving, so nothing is dropped |
+
+Not covered, because none of it exists yet: deadline propagation between hops, outlier
+ejection, retry budgets, inbound context stamping. Those are P1 in
 [TODO.md](../docs/TODO.md), and this folder is where their end-to-end tests should go —
 `StartSlowEcho` is the first of the failure modes `Echo` will grow (flaky, 503), and
-`routing.ServiceConfig` is where per-service policy will hang.
+`config.Service` (built with `config.NewService`) is where per-service policy hangs.
 
 ## Addressing
 
@@ -90,5 +103,5 @@ whatever service the Host names, not a route to `service-b`.
 
 | TODO item | What changes here |
 |---|---|
-| YAML config (P0) | the demo can then write a config file and exec the real binary instead of wiring `routing.NewTable` + `proxy.New` itself — a stronger end-to-end test, since it would cover startup too |
+| Demo on the control plane | `demo/main.go` still wires a static `routing.NewTable`; it could start a control plane and `StartMeshSidecar`s instead, like `discovery_test.go` |
 | Inbound listener (P1) | put an inbound sidecar in front of `StartEcho` and assert `X-Request-Id` / deadline headers arrive at the app |

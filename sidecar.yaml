@@ -1,0 +1,29 @@
+# Sidecar startup configuration — optional. Everything has a default except
+# the three identity fields below, and in Kubernetes those come from
+# environment variables (SIDECAR_SERVICE, SIDECAR_ADVERTISE,
+# SIDECAR_CONTROL_PLANE) set by the Downward API, so pods need no file at all.
+# Routes, instances and per-service policy are not here: they come from the
+# control plane (mesh.yaml). Read once at startup. Reference: docs/CONFIG.md.
+#
+#   go run ./cmd/controlplane -mesh mesh.yaml &
+#   go run ./cmd/sidecar -config sidecar.yaml
+
+controlPlane:
+  address: "127.0.0.1:15100"     # where to register and fetch snapshots from
+
+service:
+  name: orders-svc               # what this pod registers as; callers use it in Host
+  advertise: "127.0.0.1:8080"    # where other sidecars reach this instance. Should
+                                 # be this sidecar's inbound port; until inbound
+                                 # exists (docs/TODO.md) it is the app itself.
+
+app:
+  address: "127.0.0.1:8080"      # the local app; probed before registering
+  healthPath: /healthz           # 2xx/3xx = healthy; "" registers without checking
+
+listeners:
+  outbound: "127.0.0.1:15001"    # where the local app sends its calls
+  admin: "0.0.0.0:15020"         # /healthz, /readyz, /snapshot
+
+log:
+  level: debug

@@ -2,80 +2,15 @@ package routing
 
 import (
 	"net/url"
-	"strings"
 	"testing"
 	"time"
+
+	"sidecar/internal/config"
 )
-
-func TestInstanceAddressForm(t *testing.T) {
-	tests := []struct {
-		name    string
-		addr    string
-		wantErr string // substring; empty means the address is accepted
-	}{
-		// The host is whatever the dialler can resolve: instances live wherever
-		// the operator runs them, so nothing here narrows that on purpose.
-		{name: "ipv4", addr: "10.0.0.7:15000"},
-		{name: "loopback", addr: "127.0.0.1:8080"},
-		{name: "dns single label", addr: "orders-svc:15000"},
-		{name: "dns dotted", addr: "orders-svc.internal:15000"},
-		{name: "dns fully qualified", addr: "orders-svc.internal.:15000"},
-		{name: "dns mixed case", addr: "ORDERS-SVC.Internal:15000"},
-		{name: "dns punycode", addr: "xn--caf-dma.example:15000"},
-		{name: "ipv6 loopback", addr: "[::1]:15000"},
-		{name: "ipv6", addr: "[2001:db8::7]:15000"},
-		{name: "ipv6 zone", addr: "[fe80::1%eth0]:15000"},
-
-		// An unbracketed IPv6 address cannot be accepted even in principle:
-		// the last group is ambiguously a port or part of the address. The
-		// error has to say so, since the fix is not obvious.
-		{name: "ipv6 unbracketed", addr: "2001:db8::7:15000", wantErr: "in brackets"},
-		{name: "ipv6 loopback unbracketed", addr: "::1:15000", wantErr: "in brackets"},
-
-		// The old spike form. Worth a precise error rather than a dial that
-		// fails much later, since every doc and log line now says host:port.
-		{name: "scheme", addr: "http://10.0.0.7:15000", wantErr: "without a scheme"},
-		{name: "scheme and path", addr: "https://www.example.com/", wantErr: "without a scheme"},
-		{name: "trailing path", addr: "10.0.0.7:15000/v1", wantErr: "without a scheme"},
-
-		{name: "no port", addr: "10.0.0.7", wantErr: "want host:port"},
-		{name: "dns name with no port", addr: "orders-svc.internal", wantErr: "want host:port"},
-		{name: "no host", addr: ":15000", wantErr: "host is empty"},
-		{name: "port zero", addr: "10.0.0.7:0", wantErr: "not 1..65535"},
-		{name: "port too high", addr: "10.0.0.7:70000", wantErr: "not 1..65535"},
-		{name: "named port", addr: "10.0.0.7:http", wantErr: "not 1..65535"},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			_, err := NewTable(map[string]ServiceConfig{"svc": {Instances: []string{tc.addr}}})
-
-			if tc.wantErr == "" {
-				if err != nil {
-					t.Fatalf("NewTable(%q) = %v, want it accepted", tc.addr, err)
-				}
-				return
-			}
-			if err == nil {
-				t.Fatalf("NewTable(%q) = nil, want an error", tc.addr)
-			}
-			if !strings.Contains(err.Error(), tc.wantErr) {
-				t.Errorf("error = %q, want it to mention %q", err, tc.wantErr)
-			}
-			// The operator needs to know which entry to go and fix.
-			if !strings.Contains(err.Error(), "svc") || !strings.Contains(err.Error(), tc.addr) {
-				t.Errorf("error = %q, want it to name the service and the address", err)
-			}
-		})
-	}
-}
 
 // Instances are dialled over plain HTTP in v1; the scheme is not per-instance config.
 func TestInstanceDialsHTTP(t *testing.T) {
-	table, err := NewTable(map[string]ServiceConfig{"svc": {Instances: []string{"10.0.0.7:15000"}}})
-	if err != nil {
-		t.Fatalf("NewTable: %v", err)
-	}
+	table := NewTable([]config.Service{config.NewService("svc", "10.0.0.7:15000")})
 	svc, _ := table.GetService("svc")
 
 	got, ok := svc.Pick(nil)
@@ -94,55 +29,29 @@ func TestInstanceDialsHTTP(t *testing.T) {
 	}
 }
 
-// A duplicate would get two slots in the pool and two sets of outlier state.
-func TestRejectsDuplicateInstance(t *testing.T) {
-	_, err := NewTable(map[string]ServiceConfig{
-		"svc": {Instances: []string{"10.0.0.7:15000", "10.0.0.8:15000", "10.0.0.7:15000"}},
-	})
-	if err == nil || !strings.Contains(err.Error(), "listed twice") {
-		t.Errorf("error = %v, want it to reject the duplicate", err)
-	}
-}
+// Routing owns no defaults: the resolved policy reaches the proxy unchanged.
+func TestNewTableCarriesPolicy(t *testing.T) {
+	custom := config.NewService("custom", "10.0.0.7:15000")
+	custom.Timeout = time.Second
+	custom.Retry.MaxAttempts = 1
+	custom.Retry.Backoff.Base = 7 * time.Millisecond
 
-// The same address under two services is two different upstreams, not a duplicate.
-func TestSameAddressInTwoServices(t *testing.T) {
-	_, err := NewTable(map[string]ServiceConfig{
-		"a": {Instances: []string{"10.0.0.7:15000"}},
-		"b": {Instances: []string{"10.0.0.7:15000"}},
-	})
-	if err != nil {
-		t.Errorf("NewTable = %v, want it accepted", err)
-	}
-}
+	table := NewTable([]config.Service{custom, config.NewService("default", "10.0.0.8:15000")})
 
-func TestDefaultsApplied(t *testing.T) {
-	table, err := NewTable(map[string]ServiceConfig{
-		"explicit": {Instances: []string{"10.0.0.7:15000"}, Timeout: time.Second, MaxAttempts: 1},
-		"default":  {Instances: []string{"10.0.0.8:15000"}},
-	})
-	if err != nil {
-		t.Fatalf("NewTable: %v", err)
+	svc, _ := table.GetService("custom")
+	if svc.Timeout != time.Second || svc.Retry.MaxAttempts != 1 || svc.Retry.Backoff.Base != 7*time.Millisecond {
+		t.Errorf("policy lost: timeout = %v, maxAttempts = %d, backoff.base = %v",
+			svc.Timeout, svc.Retry.MaxAttempts, svc.Retry.Backoff.Base)
 	}
 
-	svc, _ := table.GetService("default")
-	if svc.Timeout != DefaultTimeout {
-		t.Errorf("timeout = %v, want %v", svc.Timeout, DefaultTimeout)
-	}
-	if svc.MaxAttempts != DefaultMaxAttempts {
-		t.Errorf("maxAttempts = %d, want %d", svc.MaxAttempts, DefaultMaxAttempts)
-	}
-
-	svc, _ = table.GetService("explicit")
-	if svc.Timeout != time.Second || svc.MaxAttempts != 1 {
-		t.Errorf("overrides lost: timeout = %v, maxAttempts = %d", svc.Timeout, svc.MaxAttempts)
+	svc, _ = table.GetService("default")
+	if want := config.NewService("x").Policy; svc.Policy != want {
+		t.Errorf("default policy = %+v, want %+v", svc.Policy, want)
 	}
 }
 
 func TestUnknownService(t *testing.T) {
-	table, err := NewTable(nil)
-	if err != nil {
-		t.Fatalf("NewTable: %v", err)
-	}
+	table := NewTable(nil)
 	if _, ok := table.GetService("nope"); ok {
 		t.Error("GetService found a service in an empty table")
 	}
@@ -151,12 +60,9 @@ func TestUnknownService(t *testing.T) {
 // Pick walks the pool in order and skips what the caller has already tried,
 // which is what keeps retries off an instance that just failed.
 func TestPickRoundRobinSkipsExcluded(t *testing.T) {
-	table, err := NewTable(map[string]ServiceConfig{
-		"svc": {Instances: []string{"10.0.0.1:15000", "10.0.0.2:15000", "10.0.0.3:15000"}},
+	table := NewTable([]config.Service{
+		config.NewService("svc", "10.0.0.1:15000", "10.0.0.2:15000", "10.0.0.3:15000"),
 	})
-	if err != nil {
-		t.Fatalf("NewTable: %v", err)
-	}
 	svc, _ := table.GetService("svc")
 
 	first, ok := svc.Pick(nil)
@@ -179,10 +85,7 @@ func TestPickRoundRobinSkipsExcluded(t *testing.T) {
 }
 
 func TestPickWithNoInstances(t *testing.T) {
-	table, err := NewTable(map[string]ServiceConfig{"svc": {}})
-	if err != nil {
-		t.Fatalf("NewTable: %v", err)
-	}
+	table := NewTable([]config.Service{config.NewService("svc")})
 	svc, _ := table.GetService("svc")
 
 	if _, ok := svc.Pick(nil); ok {
@@ -195,12 +98,7 @@ func TestPickWithNoInstances(t *testing.T) {
 
 // Round-robin should spread requests evenly, not favour the first instance.
 func TestPickSpreadsEvenly(t *testing.T) {
-	table, err := NewTable(map[string]ServiceConfig{
-		"svc": {Instances: []string{"10.0.0.1:15000", "10.0.0.2:15000"}},
-	})
-	if err != nil {
-		t.Fatalf("NewTable: %v", err)
-	}
+	table := NewTable([]config.Service{config.NewService("svc", "10.0.0.1:15000", "10.0.0.2:15000")})
 	svc, _ := table.GetService("svc")
 
 	counts := map[string]int{}
@@ -216,5 +114,54 @@ func TestPickSpreadsEvenly(t *testing.T) {
 		if n != 5 {
 			t.Errorf("%s served %d of 10 picks, want 5", host, n)
 		}
+	}
+}
+
+// A request that resolved its service before a swap keeps a working *Service.
+func TestStoreSwap(t *testing.T) {
+	first := NewTable([]config.Service{config.NewService("svc", "10.0.0.1:15000")})
+	second := NewTable([]config.Service{
+		config.NewService("svc", "10.0.0.2:15000"),
+		config.NewService("added", "10.0.0.3:15000"),
+	})
+
+	store := NewStore(first)
+	inFlight, ok := store.GetService("svc")
+	if !ok {
+		t.Fatal("svc missing before swap")
+	}
+	if _, ok := store.GetService("added"); ok {
+		t.Fatal("added resolved before it was configured")
+	}
+
+	store.Swap(second)
+
+	svc, ok := store.GetService("svc")
+	if !ok {
+		t.Fatal("svc missing after swap")
+	}
+	if got, _ := svc.Pick(nil); got.Host != "10.0.0.2:15000" {
+		t.Errorf("after swap svc picks %s, want 10.0.0.2:15000", got.Host)
+	}
+	if _, ok := store.GetService("added"); !ok {
+		t.Error("added not resolvable after swap")
+	}
+	if got, _ := inFlight.Pick(nil); got.Host != "10.0.0.1:15000" {
+		t.Errorf("in-flight service picks %s, want its original 10.0.0.1:15000", got.Host)
+	}
+}
+
+func TestEmptyStoreIsNotReady(t *testing.T) {
+	store := NewStore(nil)
+	if store.Ready() {
+		t.Error("a store with no table reports ready")
+	}
+	if _, ok := store.GetService("svc"); ok {
+		t.Error("GetService found a service in a store with no table")
+	}
+
+	store.Swap(NewTable(nil))
+	if !store.Ready() {
+		t.Error("a store holding an empty table is not ready; empty is a valid snapshot")
 	}
 }
