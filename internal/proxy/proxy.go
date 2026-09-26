@@ -61,7 +61,7 @@ func serviceName(r *http.Request) string {
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	name := serviceName(r)
-	log := h.log.With("service", name, "method", r.Method, "path", r.URL.Path)
+	log := h.log.With("target", name, "method", r.Method, "path", r.URL.Path)
 
 	if name == "" {
 		log.Warn("request has no target service")

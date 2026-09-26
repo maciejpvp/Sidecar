@@ -38,7 +38,7 @@ func main() {
 		os.Exit(1)
 	}
 	level.Set(cfg.Log.Level)
-	logger = logger.With("service", cfg.Service.Name)
+	logger = logger.With("self", cfg.Service.Name)
 
 	if err := run(cfg, logger); err != nil {
 		logger.Error("sidecar_failed", "error", err)
