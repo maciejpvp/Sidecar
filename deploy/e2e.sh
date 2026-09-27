@@ -74,12 +74,13 @@ sidecar_admin() { # <pod> <path>
 }
 web_pod() { kubectl get pod -l app=web -o jsonpath='{.items[0].metadata.name}'; }
 
-# Sorted "ip:5678" of every running orders-svc pod, one per line.
+# Sorted "ip:15000" of every running orders-svc pod, one per line: what a pod
+# advertises is its sidecar's inbound listener, not the app.
 # Terminating pods are left out: they deregister on SIGTERM.
 orders_pods() {
   kubectl get pod -l app=orders-svc -o json | jq -r '.items[]
     | select(.status.phase == "Running" and .metadata.deletionTimestamp == null and .status.podIP != null)
-    | .status.podIP + ":5678"' | sort
+    | .status.podIP + ":15000"' | sort
 }
 # Sorted instances of a service, as the control plane hands them out.
 cp_instances() { # <service>

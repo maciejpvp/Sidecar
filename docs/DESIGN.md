@@ -498,8 +498,9 @@ Instances are in neither: they register themselves (§13).
 
 ## 9. Lifecycle
 
-- **Startup (sidecar)**: load + validate config (invalid → exit 1). Bind outbound and admin
-  listeners (failure → exit 1). Start the watcher and the registrar. Log `ready`. Until the first
+- **Startup (sidecar)**: load + validate config (invalid → exit 1). Bind the inbound, outbound and
+  admin listeners — all or none, since a sidecar missing one would register itself and then refuse
+  the traffic that follows (failure → exit 1). Start the watcher and the registrar. Log `ready`. Until the first
   snapshot, `/readyz` is 503 and outbound calls get `503 mesh_not_ready`; the registrar registers as
   soon as the app's health check passes, independently of snapshots.
 - **Shutdown (sidecar)** on SIGINT/SIGTERM: `shutdown_started` → **deregister first** (callers stop

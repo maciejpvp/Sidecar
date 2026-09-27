@@ -4,6 +4,9 @@
 # The sidecar block is identical in every Deployment; only the app port and
 # health path vary. The service name is the pod's `app` label.
 #
+# The app binds loopback only: the mesh reaches it through the sidecar's
+# inbound listener on :15000, which is also what the pod advertises.
+#
 # The sidecar is a native sidecar (an init container with restartPolicy:
 # Always, Kubernetes 1.29+): it starts before the app, so the app's first
 # outbound call already has a sidecar, and it is stopped after the app, so
@@ -30,10 +33,8 @@ spec:
               valueFrom: {fieldRef: {fieldPath: status.podIP}}
             - name: SIDECAR_SERVICE
               valueFrom: {fieldRef: {fieldPath: "metadata.labels['app']"}}
-            # Should be $(POD_IP):15000, the sidecar's inbound listener. Until
-            # that exists (docs/TODO.md) callers reach the app directly.
             - name: SIDECAR_ADVERTISE
-              value: "$(POD_IP):5678"
+              value: "$(POD_IP):15000"
             - name: SIDECAR_CONTROL_PLANE
               value: "sidecar-controlplane.mesh.svc.cluster.local:15100"
             - name: SIDECAR_APP_ADDRESS
@@ -41,6 +42,7 @@ spec:
             - name: SIDECAR_APP_HEALTH_PATH
               value: "/"
           ports:
+            - {name: inbound, containerPort: 15000}
             - {name: admin, containerPort: 15020}
           readinessProbe:
             httpGet: {path: /readyz, port: admin}
@@ -52,9 +54,7 @@ spec:
       containers:
         - name: app
           image: hashicorp/http-echo:1.0
-          args: ["-listen=:5678", "-text=hello from orders-svc"]
-          ports:
-            - containerPort: 5678
+          args: ["-listen=127.0.0.1:5678", "-text=hello from orders-svc"]
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -79,7 +79,7 @@ spec:
             - name: SIDECAR_SERVICE
               valueFrom: {fieldRef: {fieldPath: "metadata.labels['app']"}}
             - name: SIDECAR_ADVERTISE
-              value: "$(POD_IP):8080"
+              value: "$(POD_IP):15000"
             - name: SIDECAR_CONTROL_PLANE
               value: "sidecar-controlplane.mesh.svc.cluster.local:15100"
             - name: SIDECAR_APP_ADDRESS
@@ -87,6 +87,7 @@ spec:
             - name: SIDECAR_APP_HEALTH_PATH
               value: "/healthz"
           ports:
+            - {name: inbound, containerPort: 15000}
             - {name: admin, containerPort: 15020}
           readinessProbe:
             httpGet: {path: /readyz, port: admin}
@@ -107,5 +108,5 @@ spec:
             - sh
             - -c
             - |
-              mkdir -p /www && echo ok > /www/healthz && httpd -p 8080 -h /www
+              mkdir -p /www && echo ok > /www/healthz && httpd -p 127.0.0.1:8080 -h /www
               while true; do wget -qO- http://orders-svc/ || echo "call failed"; sleep 2; done

@@ -13,9 +13,8 @@ controlPlane:
 
 service:
   name: orders-svc               # what this pod registers as; callers use it in Host
-  advertise: "127.0.0.1:8080"    # where other sidecars reach this instance. Should
-                                 # be this sidecar's inbound port; until inbound
-                                 # exists (docs/TODO.md) it is the app itself.
+  advertise: "127.0.0.1:15000"   # where other sidecars reach this instance: this
+                                 # sidecar's inbound listener, never the app
 
 app:
   address: "127.0.0.1:8080"      # the local app; probed before registering

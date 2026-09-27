@@ -6,8 +6,9 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
-	"strings"
 	"time"
+
+	"sidecar/internal/reqctx"
 )
 
 type Dir string
@@ -41,10 +42,9 @@ type Record struct {
 func Start(w http.ResponseWriter, dir Dir, r *http.Request) (*Record, http.ResponseWriter) {
 	rw := &responseWriter{ResponseWriter: w}
 	return &Record{
-		dir: dir,
-		// Empty until the inbound listener stamps these (§3.2).
-		requestID: r.Header.Get("X-Request-Id"),
-		traceID:   traceID(r.Header.Get("Traceparent")),
+		dir:       dir,
+		requestID: r.Header.Get(reqctx.HeaderRequestID),
+		traceID:   reqctx.TraceID(r.Header.Get(reqctx.HeaderTraceparent)),
 		method:    r.Method,
 		path:      r.URL.Path,
 		start:     time.Now(),
@@ -93,24 +93,4 @@ func (rec *Record) Emit(log *slog.Logger) {
 		"deadlineMs", rec.Deadline.Milliseconds(),
 		"sidecarError", rec.sidecarError,
 	)
-}
-
-// traceID is the trace-id of a W3C traceparent (version-traceid-spanid-flags):
-// 32 lowercase hex digits, not all zero. Anything else gives "" rather than junk
-// in the correlation field.
-func traceID(traceparent string) string {
-	parts := strings.Split(traceparent, "-")
-	if len(parts) < 4 {
-		return ""
-	}
-
-	id := parts[1]
-	if len(id) != 32 || strings.Trim(id, "0") == "" || strings.ContainsFunc(id, notLowerHex) {
-		return ""
-	}
-	return id
-}
-
-func notLowerHex(r rune) bool {
-	return !(r >= '0' && r <= '9' || r >= 'a' && r <= 'f')
 }

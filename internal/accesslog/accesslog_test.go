@@ -57,33 +57,6 @@ func TestResponseWriterUnwrapKeepsFlushing(t *testing.T) {
 	}
 }
 
-func TestTraceID(t *testing.T) {
-	tests := []struct {
-		name        string
-		traceparent string
-		want        string
-	}{
-		{"valid", "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01", "4bf92f3577b34da6a3ce929d0e0e4736"},
-		{"absent", "", ""},
-		{"not a traceparent", "garbage", ""},
-		{"truncated", "00-4bf92f3577b34da6a3ce929d0e0e4736", ""},
-		// Four fields are not enough: whatever sits in the second one ends up in
-		// the correlation field, so it has to look like a trace id too.
-		{"four fields of junk", "not-a-valid-header", ""},
-		{"too short", "00-4bf92f3577b34da6a3ce929d0e0e473-00f067aa0ba902b7-01", ""},
-		{"uppercase hex", "00-4BF92F3577B34DA6A3CE929D0E0E4736-00f067aa0ba902b7-01", ""},
-		{"all zeroes", "00-00000000000000000000000000000000-00f067aa0ba902b7-01", ""},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := traceID(tc.traceparent); got != tc.want {
-				t.Errorf("traceID(%q) = %q, want %q", tc.traceparent, got, tc.want)
-			}
-		})
-	}
-}
-
 // emit writes rec and decodes the line the way a log consumer reads it.
 func emit(t *testing.T, rec *Record) map[string]any {
 	t.Helper()
