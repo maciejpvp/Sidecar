@@ -8,9 +8,10 @@ Current state: outbound proxy on `127.0.0.1:15001`, services addressed by `Host`
 **routes from a control plane** — sidecars register themselves with leases while their app is
 healthy and long-poll versioned snapshots (DESIGN §13, QUESTIONS D5–D9); per-service policy in the
 control plane's hot-reloaded `mesh.yaml` (D6). Round-robin with retries on a fresh instance,
-per-service request deadline, JSON error model, JSON logger, admin endpoints for Kubernetes probes,
-graceful shutdown that deregisters before draining. Kubernetes manifests in [../deploy](../deploy).
-End-to-end demo and tests in [../e2e](../e2e). No inbound listener, no access log.
+per-service request deadline, JSON error model, JSON logger with one access line per request
+(DESIGN §11), admin endpoints for Kubernetes probes, graceful shutdown that deregisters before
+draining. Kubernetes manifests in [../deploy](../deploy). End-to-end demo and tests in
+[../e2e](../e2e). No inbound listener.
 
 ---
 
@@ -63,9 +64,19 @@ End-to-end demo and tests in [../e2e](../e2e). No inbound listener, no access lo
   a *hanging* upstream gets one attempt and no retry).
   *Done:* `e2e.TestDeadlineExceeded` and `proxy.TestRetriesStopAtDeadline`.
 
-- [ ] **Access log, one line per request** (DESIGN §11) — you cannot debug retries or ejection
-  by reading code. Build this *before* the resilience work, not after.
-  *Done when:* every request logs method/service/path/status/attempts/durationMs/sidecarError.
+- [x] **Access log, one line per request** (DESIGN §11) — you cannot debug retries or ejection by
+  reading code, which is why this landed before the resilience work rather than after.
+  `internal/accesslog` is its own package: the inbound listener will log the same shape with
+  `dir: "inbound"`.
+  *Done:* every request through the outbound proxy writes one INFO line carrying dir, requestId,
+  traceId, method, target, path, status, attempts, instances, durationMs, deadlineMs and
+  sidecarError — the early returns (`no_route`, `mesh_not_ready`, `bad_request`) and a client that
+  hangs up mid-request (`status: 0`) included. The event lines it replaced are gone, so a request is
+  one line; what survives alongside it are the two `Error` lines carrying an `error` value the
+  format has nowhere to put. Covered by `accesslog.TestEmitFields` and `proxy.TestAccessLog*`.
+  - `requestId`/`traceId` are passed through and stay empty until the inbound listener stamps them
+    (§3.2); `deadlineMs` is `service.timeout` until propagation makes it
+    `min(propagated budget, timeout)` (§5.3). Neither needs a change here when those land.
 
 ---
 

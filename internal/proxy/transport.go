@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"time"
 
+	"sidecar/internal/accesslog"
 	"sidecar/internal/routing"
 )
 
@@ -36,6 +37,11 @@ type attemptTripper struct {
 	svc  *routing.Service
 	base http.RoundTripper
 	log  *slog.Logger
+
+	// rec is this request's access line, so every attempt lands in it. No
+	// synchronisation: a tripper is built per request (proxy.go) and RoundTrip
+	// runs on the same goroutine as the handler.
+	rec *accesslog.Record
 }
 
 func (t *attemptTripper) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -57,6 +63,7 @@ func (t *attemptTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 			return nil, ErrNoHealthyUpstream
 		}
 		tried = append(tried, target)
+		t.rec.Attempt(target)
 
 		out, err := t.request(req, target)
 		if err != nil {

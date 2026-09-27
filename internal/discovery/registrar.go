@@ -34,7 +34,7 @@ type Registrar struct {
 func NewRegistrar(client *Client, log *slog.Logger, service, advertise string, health func(context.Context) error) *Registrar {
 	return &Registrar{
 		client: client,
-		log:    log.With("service", service, "address", advertise),
+		log:    log.With("address", advertise),
 		reg:    meshapi.Registration{Service: service, Address: advertise, ID: newID()},
 		health: health,
 		Probe:  time.Second,

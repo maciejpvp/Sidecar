@@ -532,10 +532,14 @@ Instances are in neither: they register themselves (§13).
 
 ## 11. Access log format
 
-One JSON line per request (slog `JSONHandler`):
+One JSON line per request (slog `JSONHandler`). Two names, never one `service`: `self` is the
+sidecar writing the line (on every line it writes, event logs included), `target` is the service
+being called. A single `service` key would mean one thing in an event log and the other here — and
+`JSONHandler` does not deduplicate keys, so both would end up in the same line with the parser
+silently taking the last.
 
 ```json
-{"time":"2026-09-13T10:00:00.123Z","level":"INFO","msg":"access","dir":"outbound","requestId":"7f3a…","traceId":"4bf9…","method":"GET","service":"orders-svc","path":"/v1/orders/42","status":200,"attempts":2,"instances":["10.0.0.7:15000","10.0.0.8:15000"],"durationMs":184,"deadlineMs":2600,"sidecarError":""}
+{"time":"2026-09-13T10:00:00.123Z","level":"INFO","msg":"access","self":"web","dir":"outbound","requestId":"7f3a…","traceId":"4bf9…","method":"GET","target":"orders-svc","path":"/v1/orders/42","status":200,"attempts":2,"instances":["10.0.0.7:15000","10.0.0.8:15000"],"durationMs":184,"deadlineMs":2600,"sidecarError":""}
 ```
 
 Event logs, sidecar: `config_rejected`, `ready`, `waiting_for_app`, `registered`, `app_unhealthy`,
