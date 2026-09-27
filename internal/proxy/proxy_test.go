@@ -1,11 +1,13 @@
 package proxy
 
 import (
+	"context"
 	"io"
 	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -85,25 +87,98 @@ func service(instances ...string) config.Service {
 
 func newSidecar(t *testing.T, svc config.Service) *httptest.Server {
 	t.Helper()
-	table := routing.NewTable([]config.Service{svc})
-	srv := httptest.NewServer(New(table, slog.New(slog.DiscardHandler)))
-	t.Cleanup(srv.Close)
+	srv, _ := newSidecarLogging(t, svc)
 	return srv
 }
 
+// newSidecarLogging is newSidecar plus the access lines it writes.
+func newSidecarLogging(t *testing.T, svc config.Service) (*httptest.Server, *accessLog) {
+	t.Helper()
+	al := newAccessLog()
+	table := routing.NewTable([]config.Service{svc})
+	srv := httptest.NewServer(New(table, slog.New(al)))
+	t.Cleanup(srv.Close)
+	return srv, al
+}
+
 func call(t *testing.T, sidecar *httptest.Server, method string, body io.Reader) *http.Response {
+	t.Helper()
+	return callHost(t, sidecar, "svc", method, body)
+}
+
+// callHost is call addressed to a service name of the test's choosing, for the
+// cases where the name itself is the point.
+func callHost(t *testing.T, sidecar *httptest.Server, host, method string, body io.Reader) *http.Response {
 	t.Helper()
 	req, err := http.NewRequest(method, sidecar.URL+"/v1/thing", body)
 	if err != nil {
 		t.Fatalf("build request: %v", err)
 	}
-	req.Host = "svc"
+	req.Host = host
 	res, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("call sidecar: %v", err)
 	}
 	t.Cleanup(func() { res.Body.Close() })
 	return res
+}
+
+// accessLog captures the access lines a sidecar writes (DESIGN §11). A channel
+// rather than a buffer: the line is emitted on the server's goroutine after the
+// client already holds the response, so receiving is the synchronisation point
+// that a time.Sleep would only paper over.
+type accessLog struct {
+	lines chan map[string]any
+}
+
+func newAccessLog() *accessLog {
+	return &accessLog{lines: make(chan map[string]any, 8)}
+}
+
+func (a *accessLog) Enabled(context.Context, slog.Level) bool { return true }
+
+func (a *accessLog) Handle(_ context.Context, r slog.Record) error {
+	if r.Message != "access" {
+		return nil
+	}
+
+	line := make(map[string]any, r.NumAttrs())
+	r.Attrs(func(at slog.Attr) bool {
+		line[at.Key] = at.Value.Any()
+		return true
+	})
+
+	select {
+	case a.lines <- line:
+	default: // a test that ignores the log must never wedge the handler
+	}
+	return nil
+}
+
+func (a *accessLog) WithAttrs([]slog.Attr) slog.Handler { return a }
+func (a *accessLog) WithGroup(string) slog.Handler      { return a }
+
+// next returns the access line for one request, failing instead of hanging.
+func (a *accessLog) next(t *testing.T) map[string]any {
+	t.Helper()
+	select {
+	case line := <-a.lines:
+		return line
+	case <-time.After(2 * time.Second):
+		t.Fatal("no access line was written")
+		return nil
+	}
+}
+
+// field reads one field of an access line, failing if it is missing or is not
+// the type §11 says it is.
+func field[T any](t *testing.T, line map[string]any, key string) T {
+	t.Helper()
+	v, ok := line[key].(T)
+	if !ok {
+		t.Fatalf("%s = %#v, want a %T", key, line[key], v)
+	}
+	return v
 }
 
 func TestRetriesOntoHealthyInstance(t *testing.T) {
@@ -370,5 +445,137 @@ func TestRetriesStopAtDeadline(t *testing.T) {
 	}
 	if elapsed > time.Second {
 		t.Errorf("took %v, want the deadline to cut it short", elapsed)
+	}
+}
+
+// One line per request, whatever the outcome (DESIGN §11). The cases below are
+// the outcomes that differ in what the line has to say.
+
+func TestAccessLogHappyPath(t *testing.T) {
+	up := newUpstream(t, http.StatusOK)
+
+	svc := service(up.addr())
+	svc.Timeout = 2 * time.Second // not the default, so deadlineMs proves it tracks the service
+	sidecar, al := newSidecarLogging(t, svc)
+
+	call(t, sidecar, http.MethodGet, nil)
+
+	line := al.next(t)
+	for key, want := range map[string]string{
+		"dir": "outbound", "target": "svc", "method": http.MethodGet,
+		"path": "/v1/thing", "sidecarError": "",
+	} {
+		if got := field[string](t, line, key); got != want {
+			t.Errorf("%s = %q, want %q", key, got, want)
+		}
+	}
+	for key, want := range map[string]int64{"status": 200, "attempts": 1, "deadlineMs": 2000} {
+		if got := field[int64](t, line, key); got != want {
+			t.Errorf("%s = %d, want %d", key, got, want)
+		}
+	}
+	if got := field[[]string](t, line, "instances"); !slices.Equal(got, []string{up.addr()}) {
+		t.Errorf("instances = %v, want [%s]", got, up.addr())
+	}
+}
+
+// A name the table does not hold never reaches an instance, and the line says
+// so: no attempts, no instances, and the name that was asked for.
+func TestAccessLogNoRoute(t *testing.T) {
+	sidecar, al := newSidecarLogging(t, service(newUpstream(t, http.StatusOK).addr()))
+
+	res := callHost(t, sidecar, "nope", http.MethodGet, nil)
+	if res.StatusCode != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", res.StatusCode)
+	}
+
+	line := al.next(t)
+	if got := field[string](t, line, "sidecarError"); got != "no_route" {
+		t.Errorf("sidecarError = %q, want no_route", got)
+	}
+	if got := field[string](t, line, "target"); got != "nope" {
+		t.Errorf("target = %q, want nope", got)
+	}
+	for key, want := range map[string]int64{"status": 404, "attempts": 0} {
+		if got := field[int64](t, line, key); got != want {
+			t.Errorf("%s = %d, want %d", key, got, want)
+		}
+	}
+	if got := field[[]string](t, line, "instances"); len(got) != 0 {
+		t.Errorf("instances = %v, want empty", got)
+	}
+}
+
+// A sidecar with no snapshot yet logs the request it could not route like any
+// other, and its deadline is 0 because no service policy was ever found.
+func TestAccessLogMeshNotReady(t *testing.T) {
+	al := newAccessLog()
+	sidecar := httptest.NewServer(New(routing.NewStore(nil), slog.New(al)))
+	t.Cleanup(sidecar.Close)
+
+	res := call(t, sidecar, http.MethodGet, nil)
+	if res.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", res.StatusCode)
+	}
+
+	line := al.next(t)
+	if got := field[string](t, line, "sidecarError"); got != "mesh_not_ready" {
+		t.Errorf("sidecarError = %q, want mesh_not_ready", got)
+	}
+	for key, want := range map[string]int64{"status": 503, "attempts": 0, "deadlineMs": 0} {
+		if got := field[int64](t, line, key); got != want {
+			t.Errorf("%s = %d, want %d", key, got, want)
+		}
+	}
+}
+
+// This is the line the whole feature is for: which instances a retried request
+// actually touched.
+func TestAccessLogRecordsEveryAttempt(t *testing.T) {
+	bad := newUpstream(t, http.StatusServiceUnavailable)
+	good := newUpstream(t, http.StatusOK)
+
+	sidecar, al := newSidecarLogging(t, service(bad.addr(), good.addr()))
+
+	call(t, sidecar, http.MethodGet, nil)
+
+	line := al.next(t)
+	for key, want := range map[string]int64{"status": 200, "attempts": 2} {
+		if got := field[int64](t, line, key); got != want {
+			t.Errorf("%s = %d, want %d", key, got, want)
+		}
+	}
+	instances := field[[]string](t, line, "instances")
+	if !slices.Contains(instances, bad.addr()) || !slices.Contains(instances, good.addr()) {
+		t.Errorf("instances = %v, want the failed %s and the serving %s", instances, bad.addr(), good.addr())
+	}
+}
+
+func TestAccessLogDeadlineExceeded(t *testing.T) {
+	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-time.After(2 * time.Second):
+		case <-r.Context().Done():
+		}
+	}))
+	t.Cleanup(slow.Close)
+
+	svc := service(slow.Listener.Addr().String())
+	svc.Timeout = 150 * time.Millisecond
+	sidecar, al := newSidecarLogging(t, svc)
+
+	call(t, sidecar, http.MethodGet, nil)
+
+	line := al.next(t)
+	if got := field[string](t, line, "sidecarError"); got != "deadline_exceeded" {
+		t.Errorf("sidecarError = %q, want deadline_exceeded", got)
+	}
+	for key, want := range map[string]int64{"status": 504, "deadlineMs": 150} {
+		if got := field[int64](t, line, key); got != want {
+			t.Errorf("%s = %d, want %d", key, got, want)
+		}
+	}
+	if got := field[int64](t, line, "durationMs"); got < 150 {
+		t.Errorf("durationMs = %d, want at least the 150ms the request was given", got)
 	}
 }
