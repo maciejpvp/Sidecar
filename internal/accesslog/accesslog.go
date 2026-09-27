@@ -1,6 +1,5 @@
 // Package accesslog records one line per request, in the shape DESIGN §11
-// specifies. Its own package because the inbound listener (§3.2) will log the
-// same shape with dir "inbound".
+// specifies. Its own package: the inbound listener (§3.2) logs the same shape.
 package accesslog
 
 import (
@@ -22,23 +21,23 @@ const (
 type Record struct {
 	Target string
 
-	// Deadline is the budget the request was given: the service timeout today,
-	// min(propagated budget, timeout) once §5.3 lands.
+	// Deadline: the service timeout today, min(propagated, timeout) after §5.3.
 	Deadline time.Duration
 
-	dir       Dir
-	requestID string
-	traceID   string
-	method    string
-	path      string
-	attempts  int
-	instances []string
-	start     time.Time
-	w         *responseWriter
+	dir          Dir
+	requestID    string
+	traceID      string
+	method       string
+	path         string
+	attempts     int
+	instances    []string
+	sidecarError string
+	start        time.Time
+	w            *responseWriter
 }
 
 // Start opens a record for r and wraps w, so the status that reaches the client
-// is observable. The caller passes the returned writer down the chain.
+// is observable.
 func Start(w http.ResponseWriter, dir Dir, r *http.Request) (*Record, http.ResponseWriter) {
 	rw := &responseWriter{ResponseWriter: w}
 	return &Record{
@@ -53,8 +52,8 @@ func Start(w http.ResponseWriter, dir Dir, r *http.Request) (*Record, http.Respo
 	}, rw
 }
 
-// Attempt records one try against target: one entry per attempt, not a set of
-// distinct instances, so a retry lapping over a small pool stays visible.
+// Attempt records one try against target: one entry per attempt, so a retry
+// lapping over a small pool stays visible.
 func (rec *Record) Attempt(target *url.URL) {
 	if rec == nil {
 		return // a transport built without a record still works
@@ -63,8 +62,17 @@ func (rec *Record) Attempt(target *url.URL) {
 	rec.instances = append(rec.instances, target.Host)
 }
 
-// Emit writes the line. log supplies "self"; everything else comes from the
-// record, so no key lands twice in one line.
+// Fail records the code this sidecar answered with — not read back off
+// X-Sidecar-Error, which also carries upstream sidecars' codes (§7).
+func (rec *Record) Fail(code string) {
+	if rec == nil || rec.sidecarError != "" {
+		return // the first code is the one the client got
+	}
+	rec.sidecarError = code
+}
+
+// Emit writes the line. log supplies "self" and nothing else, so no key lands
+// twice.
 func (rec *Record) Emit(log *slog.Logger) {
 	instances := rec.instances
 	if instances == nil {
@@ -83,16 +91,26 @@ func (rec *Record) Emit(log *slog.Logger) {
 		"instances", instances,
 		"durationMs", time.Since(rec.start).Milliseconds(),
 		"deadlineMs", rec.Deadline.Milliseconds(),
-		"sidecarError", rec.w.Header().Get("X-Sidecar-Error"),
+		"sidecarError", rec.sidecarError,
 	)
 }
 
-// traceID is the trace-id field of a W3C traceparent
-// (version-traceid-spanid-flags), or "" when there is none to read.
+// traceID is the trace-id of a W3C traceparent (version-traceid-spanid-flags):
+// 32 lowercase hex digits, not all zero. Anything else gives "" rather than junk
+// in the correlation field.
 func traceID(traceparent string) string {
 	parts := strings.Split(traceparent, "-")
 	if len(parts) < 4 {
 		return ""
 	}
-	return parts[1]
+
+	id := parts[1]
+	if len(id) != 32 || strings.Trim(id, "0") == "" || strings.ContainsFunc(id, notLowerHex) {
+		return ""
+	}
+	return id
+}
+
+func notLowerHex(r rune) bool {
+	return !(r >= '0' && r <= '9' || r >= 'a' && r <= 'f')
 }

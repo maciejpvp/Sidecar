@@ -60,6 +60,20 @@ func newFlakyUpstream(t *testing.T, n int64) *upstream {
 	return u
 }
 
+// newUpstreamHeader answers with status and one header of the caller's choosing,
+// for the cases where the upstream looks like another sidecar.
+func newUpstreamHeader(t *testing.T, status int, key, value string) *upstream {
+	t.Helper()
+	u := &upstream{}
+	u.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		u.hits.Add(1)
+		w.Header().Set(key, value)
+		w.WriteHeader(status)
+	}))
+	t.Cleanup(u.srv.Close)
+	return u
+}
+
 // addr is host:port, the form a routing table stores an instance in.
 func (u *upstream) addr() string { return u.srv.Listener.Addr().String() }
 
@@ -577,5 +591,51 @@ func TestAccessLogDeadlineExceeded(t *testing.T) {
 	}
 	if got := field[int64](t, line, "durationMs"); got < 150 {
 		t.Errorf("durationMs = %d, want at least the 150ms the request was given", got)
+	}
+}
+
+// An upstream's X-Sidecar-Error reaches the caller (§7 passes responses through
+// byte-for-byte) but is not this sidecar's to claim. Once inbound listeners exist
+// (§3.2) that upstream is another sidecar, and a line blaming the wrong hop sends
+// you debugging a healthy one.
+func TestAccessLogDoesNotClaimUpstreamSidecarError(t *testing.T) {
+	up := newUpstreamHeader(t, http.StatusOK, "X-Sidecar-Error", "mesh_not_ready")
+
+	sidecar, al := newSidecarLogging(t, service(up.addr()))
+
+	res := call(t, sidecar, http.MethodGet, nil)
+	if got := res.Header.Get("X-Sidecar-Error"); got != "mesh_not_ready" {
+		t.Errorf("X-Sidecar-Error = %q, want the upstream's code passed through", got)
+	}
+
+	line := al.next(t)
+	if got := field[string](t, line, "sidecarError"); got != "" {
+		t.Errorf("sidecarError = %q, want empty: the code is the upstream's", got)
+	}
+	if got := field[int64](t, line, "status"); got != 200 {
+		t.Errorf("status = %d, want 200", got)
+	}
+}
+
+// ReverseProxy replays an upstream's 1xx to the client through the same
+// ResponseWriter, and net/http keeps the header open for the real status
+// afterwards. The line has to report what the client ended up with.
+func TestAccessLogReportsFinalStatusAfterEarlyHints(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Link", "</style.css>; rel=preload; as=style")
+		w.WriteHeader(http.StatusEarlyHints)
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(up.Close)
+
+	sidecar, al := newSidecarLogging(t, service(up.Listener.Addr().String()))
+
+	res := call(t, sidecar, http.MethodGet, nil)
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", res.StatusCode)
+	}
+
+	if got := field[int64](t, al.next(t), "status"); got != 200 {
+		t.Errorf("status = %d, want 200 — the 103 is not an answer", got)
 	}
 }

@@ -26,6 +26,12 @@ func TestResponseWriterStatus(t *testing.T) {
 			w.WriteHeader(http.StatusNotFound)
 			w.WriteHeader(http.StatusOK)
 		}, 404},
+		// net/http keeps the header open after a 1xx, and ReverseProxy replays an
+		// upstream's 1xx through here, so the real status comes afterwards.
+		{"informational status is not the answer", func(w http.ResponseWriter) {
+			w.WriteHeader(http.StatusEarlyHints)
+			w.WriteHeader(http.StatusOK)
+		}, 200},
 	}
 
 	for _, tc := range tests {
@@ -61,6 +67,12 @@ func TestTraceID(t *testing.T) {
 		{"absent", "", ""},
 		{"not a traceparent", "garbage", ""},
 		{"truncated", "00-4bf92f3577b34da6a3ce929d0e0e4736", ""},
+		// Four fields are not enough: whatever sits in the second one ends up in
+		// the correlation field, so it has to look like a trace id too.
+		{"four fields of junk", "not-a-valid-header", ""},
+		{"too short", "00-4bf92f3577b34da6a3ce929d0e0e473-00f067aa0ba902b7-01", ""},
+		{"uppercase hex", "00-4BF92F3577B34DA6A3CE929D0E0E4736-00f067aa0ba902b7-01", ""},
+		{"all zeroes", "00-00000000000000000000000000000000-00f067aa0ba902b7-01", ""},
 	}
 
 	for _, tc := range tests {
@@ -128,11 +140,9 @@ func TestEmitFields(t *testing.T) {
 	}
 }
 
-// sidecarError comes off the header writeError already sets, so the proxy needs
-// no second channel to report it.
-func TestEmitReadsSidecarErrorFromHeader(t *testing.T) {
+func TestEmitReportsFailure(t *testing.T) {
 	rec, w := Start(httptest.NewRecorder(), Outbound, httptest.NewRequest(http.MethodGet, "/", nil))
-	w.Header().Set("X-Sidecar-Error", "no_route")
+	rec.Fail("no_route")
 	w.WriteHeader(http.StatusNotFound)
 
 	line := emit(t, rec)
@@ -142,6 +152,35 @@ func TestEmitReadsSidecarErrorFromHeader(t *testing.T) {
 	}
 	if got := line["status"]; got != float64(404) {
 		t.Errorf("status = %#v, want 404", got)
+	}
+}
+
+// X-Sidecar-Error on a proxied response belongs to the upstream — once inbound
+// listeners exist (§3.2) that upstream is another sidecar, whose codes pass
+// through byte-for-byte (§7). The line must say what this hop did, so it reports
+// nothing here.
+func TestEmitIgnoresSidecarErrorHeader(t *testing.T) {
+	rec, w := Start(httptest.NewRecorder(), Outbound, httptest.NewRequest(http.MethodGet, "/", nil))
+	w.Header().Set("X-Sidecar-Error", "mesh_not_ready") // as ReverseProxy copies it in
+	w.WriteHeader(http.StatusServiceUnavailable)
+
+	line := emit(t, rec)
+
+	if got := line["sidecarError"]; got != "" {
+		t.Errorf("sidecarError = %#v, want empty: that code is the upstream's", got)
+	}
+}
+
+// Two failures on one request would mean two different stories; the client only
+// saw the first, so that is the one reported.
+func TestFailKeepsTheFirstCode(t *testing.T) {
+	rec, _ := Start(httptest.NewRecorder(), Outbound, httptest.NewRequest(http.MethodGet, "/", nil))
+
+	rec.Fail("deadline_exceeded")
+	rec.Fail("upstream_connect_failed")
+
+	if got := emit(t, rec)["sidecarError"]; got != "deadline_exceeded" {
+		t.Errorf("sidecarError = %#v, want deadline_exceeded", got)
 	}
 }
 
