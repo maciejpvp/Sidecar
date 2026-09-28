@@ -48,11 +48,15 @@ func TraceID(header string) string {
 // Timeout reads the remaining budget a caller sent on the wire.
 func Timeout(header string) (time.Duration, bool) {
 	ms, err := strconv.Atoi(header)
-	if err != nil || ms <= 0 {
+	if err != nil || ms <= 0 || int64(ms) > maxTimeoutMillis {
 		return 0, false
 	}
 	return time.Duration(ms) * time.Millisecond, true
 }
+
+// maxTimeoutMillis is the largest millisecond value that can be represented
+// by time.Duration without overflowing during conversion.
+const maxTimeoutMillis = int64((1<<63 - 1) / int64(time.Millisecond))
 
 // Deadline formats an absolute deadline for the local app; both sides of the
 // loopback read the same clock, so absolute is safe here and skew-free budgets

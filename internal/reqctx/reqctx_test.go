@@ -117,6 +117,7 @@ func TestTimeout(t *testing.T) {
 		{"0", 0, false},
 		{"-1", 0, false},
 		{"1.5", 0, false},
+		{"10000000000000", 0, false},
 	}
 
 	for _, tc := range tests {

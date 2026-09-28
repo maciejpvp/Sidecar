@@ -43,13 +43,11 @@ Service B echoes back what it received — path, `Host`, `X-Forwarded-*` — whi
 the demo output and the test assertions mean something: they describe the far side of the hop,
 not what the caller sent.
 
-### The hop that is missing
+### The complete sidecar hop
 
-DESIGN §2 has every hop going sidecar → sidecar: A's outbound listener should be talking to B's
-*inbound* listener on `:15000`, which then forwards to B's app on `127.0.0.1:8080`. There is no
-inbound listener yet ([TODO.md](../docs/TODO.md) P1), so A's sidecar talks to B's app directly.
-When inbound lands, it slots in front of `StartEcho` in [harness.go](harness.go) and nothing in
-the tests needs to change.
+DESIGN §2 has every hop going sidecar → sidecar: A's outbound listener talks to B's *inbound*
+listener, which forwards to B's app on its loopback address. The harness starts both listeners, so
+the request crosses the same boundary as it does in deployment.
 
 ## What this covers
 
