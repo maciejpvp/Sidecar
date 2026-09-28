@@ -4,14 +4,15 @@ Ordered by importance: each tier unblocks the next. Within a tier, top items fir
 Design rationale for every item lives in [DESIGN.md](DESIGN.md) (section refs below); decisions
 already settled are in [QUESTIONS.md](QUESTIONS.md).
 
-Current state: outbound proxy on `127.0.0.1:15001`, services addressed by `Host` (QUESTIONS D1),
+Current state: outbound proxy on `127.0.0.1:15001` and inbound on `0.0.0.0:15000`, so traffic
+crosses a sidecar at both ends and the app can bind loopback only. Services addressed by `Host` (QUESTIONS D1),
 **routes from a control plane** — sidecars register themselves with leases while their app is
 healthy and long-poll versioned snapshots (DESIGN §13, QUESTIONS D5–D9); per-service policy in the
 control plane's hot-reloaded `mesh.yaml` (D6). Round-robin with retries on a fresh instance,
 per-service request deadline, JSON error model, JSON logger with one access line per request
 (DESIGN §11), admin endpoints for Kubernetes probes, graceful shutdown that deregisters before
 draining. Kubernetes manifests in [../deploy](../deploy). End-to-end demo and tests in
-[../e2e](../e2e). No inbound listener.
+[../e2e](../e2e). Deadlines do not yet shrink per hop.
 
 ---
 
@@ -107,12 +108,16 @@ draining. Kubernetes manifests in [../deploy](../deploy). End-to-end demo and te
   A abandoned. Use monotonic time internally.
   *Done when:* the A→B→C worked example in §5.3 is reproducible and the budget visibly shrinks per hop.
 
-- [ ] **Inbound listener + context stamping** (DESIGN §3.2) — `:15000`, request-id and
-  `traceparent` generation/validation, deadline clamp, forward to the app. No retries, no LB.
-  Unlocks true sidecar→sidecar chains; until this exists, propagation is untestable end to end.
-  Also: sidecars currently advertise the *app's* port, because there is nothing on `:15000`; when
-  this lands, `SIDECAR_ADVERTISE` in `deploy/k8s/example.yaml` becomes `$(POD_IP):15000` and the
-  app can bind loopback only.
+- [x] **Inbound listener + context stamping** (DESIGN §3.2) — `:15000`, request-id and
+  `traceparent` generation/validation, deadline clamp, forward to the app. No retries, no LB: there
+  is exactly one app. `internal/reqctx` owns the four context headers, so `accesslog` and both
+  handlers read one definition of each.
+  *Done:* a request crosses two sidecars (`e2e.TestRequestCrossesBothSidecars`), the app is reached
+  only through inbound, and `requestId`/`traceId` in the access log stop being empty — the same id
+  appears in the caller's `dir:"outbound"` line and the callee's `dir:"inbound"` line.
+  `SIDECAR_ADVERTISE` is now `$(POD_IP):15000` and the app binds loopback only.
+  - Outbound only *passes* context through; the first inbound in a chain is what mints it. A budget
+    still does not shrink per hop — that needs the outbound half of §5.3, below.
 
 - [~] **Table swap + state carry-over** (DESIGN §8) — every snapshot is validated and swapped into
   `routing.Store`; idle connections are closed after a swap; `mesh.yaml` edits reach sidecars with

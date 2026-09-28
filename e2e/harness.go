@@ -17,6 +17,7 @@ import (
 	"sidecar/internal/config"
 	"sidecar/internal/controlplane"
 	"sidecar/internal/proxy"
+	"sidecar/internal/reqctx"
 	"sidecar/internal/routing"
 	"sidecar/internal/sidecar"
 )
@@ -30,6 +31,9 @@ type Received struct {
 	XForwardedFor   string `json:"xForwardedFor"`
 	XForwardedHost  string `json:"xForwardedHost"`
 	XForwardedProto string `json:"xForwardedProto"`
+	RequestID       string `json:"requestId"`
+	Traceparent     string `json:"traceparent"`
+	Deadline        string `json:"deadline"`
 }
 
 // Echo is a toy service: it answers every request by describing it.
@@ -87,6 +91,9 @@ func newEcho(name string, delay time.Duration, ln net.Listener) *Echo {
 			XForwardedFor:   r.Header.Get("X-Forwarded-For"),
 			XForwardedHost:  r.Header.Get("X-Forwarded-Host"),
 			XForwardedProto: r.Header.Get("X-Forwarded-Proto"),
+			RequestID:       r.Header.Get(reqctx.HeaderRequestID),
+			Traceparent:     r.Header.Get(reqctx.HeaderTraceparent),
+			Deadline:        r.Header.Get(reqctx.HeaderDeadline),
 		})
 	}))
 	if ln != nil {
@@ -124,7 +131,7 @@ func StartSidecar(addr string, services []config.Service, log *slog.Logger) (*Si
 
 	s := &Sidecar{
 		Addr: ln.Addr().String(),
-		srv:  &http.Server{Handler: proxy.New(routing.NewTable(services), log)},
+		srv:  &http.Server{Handler: proxy.NewOutbound(routing.NewTable(services), log)},
 	}
 	go s.srv.Serve(ln)
 	return s, nil
@@ -174,30 +181,39 @@ func (cp *ControlPlane) Close() {
 }
 
 // MeshSidecar is a complete sidecar as cmd/sidecar runs it — registrar,
-// snapshot watcher, outbound proxy, admin endpoints — on ephemeral ports.
+// snapshot watcher, both proxies, admin endpoints — on ephemeral ports.
 type MeshSidecar struct {
-	Addr  string // outbound
-	Admin string
+	Addr    string // outbound
+	Inbound string
+	Admin   string
 	*sidecar.Sidecar
 
-	outbound, admin *http.Server
-	cancel          context.CancelFunc
-	done            chan struct{}
+	inbound, outbound, admin *http.Server
+	cancel                   context.CancelFunc
+	done                     chan struct{}
 }
 
-// StartMeshSidecar runs a sidecar for app, registered as service. There is no
-// inbound listener yet (docs/TODO.md), so the instance it advertises is the
-// app itself, as the Kubernetes manifests in deploy/ do for now.
+// StartMeshSidecar runs a sidecar for app, registered as service. What it
+// advertises is its own inbound listener, so callers reach the app through it.
 func StartMeshSidecar(controlPlaneAddr, service string, app *Echo, log *slog.Logger) (*MeshSidecar, error) {
+	// Bound before the config is built, because the advertised address is the
+	// inbound listener's and the port is only known once it is open.
+	lns, err := loopbackListeners(3)
+	if err != nil {
+		return nil, err
+	}
+	inLn, outLn, adminLn := lns[0], lns[1], lns[2]
+
 	env := map[string]string{
 		config.Env.Service:       service,
-		config.Env.Advertise:     app.Addr,
+		config.Env.Advertise:     inLn.Addr().String(),
 		config.Env.ControlPlane:  controlPlaneAddr,
 		config.Env.AppAddress:    app.Addr,
 		config.Env.AppHealthPath: HealthPath,
 	}
 	cfg, err := config.LoadSidecar("", func(k string) string { return env[k] })
 	if err != nil {
+		closeAll(lns)
 		return nil, err
 	}
 
@@ -205,26 +221,19 @@ func StartMeshSidecar(controlPlaneAddr, service string, app *Echo, log *slog.Log
 	// Fast enough that tests do not wait on the probe loop.
 	sc.Registrar.Probe = 20 * time.Millisecond
 
-	outLn, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		return nil, fmt.Errorf("bind outbound listener: %w", err)
-	}
-	adminLn, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		outLn.Close()
-		return nil, fmt.Errorf("bind admin listener: %w", err)
-	}
-
 	ctx, cancel := context.WithCancel(context.Background())
 	m := &MeshSidecar{
 		Addr:     outLn.Addr().String(),
+		Inbound:  inLn.Addr().String(),
 		Admin:    adminLn.Addr().String(),
 		Sidecar:  sc,
+		inbound:  sc.InboundServer(),
 		outbound: sc.OutboundServer(),
 		admin:    sc.AdminServer(),
 		cancel:   cancel,
 		done:     make(chan struct{}),
 	}
+	go m.inbound.Serve(inLn)
 	go m.outbound.Serve(outLn)
 	go m.admin.Serve(adminLn)
 	go func() {
@@ -241,18 +250,48 @@ func (m *MeshSidecar) Close() {
 	<-m.done
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
+	m.inbound.Shutdown(ctx)
 	m.outbound.Shutdown(ctx)
 	m.admin.Shutdown(ctx)
+}
+
+// loopbackListeners binds n ephemeral loopback listeners, or none of them.
+func loopbackListeners(n int) ([]net.Listener, error) {
+	var lns []net.Listener
+	for range n {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			closeAll(lns)
+			return nil, fmt.Errorf("bind loopback listener: %w", err)
+		}
+		lns = append(lns, ln)
+	}
+	return lns, nil
+}
+
+func closeAll(lns []net.Listener) {
+	for _, ln := range lns {
+		ln.Close()
+	}
 }
 
 // Call is how an app addresses a service: connect to the local sidecar, name
 // the service in Host. The path stays the upstream's own.
 func Call(sidecarAddr, service, path string) (*http.Response, error) {
+	return CallWith(sidecarAddr, service, path, nil)
+}
+
+// CallWith is Call carrying headers, the way an app that follows the contract in
+// DESIGN §4 copies request context onto its outbound calls.
+func CallWith(sidecarAddr, service, path string, h http.Header) (*http.Response, error) {
 	req, err := http.NewRequest(http.MethodGet, "http://"+sidecarAddr+path, nil)
 	if err != nil {
 		return nil, err
 	}
 	req.Host = service
+	for k, vs := range h {
+		req.Header[k] = vs
+	}
 	return http.DefaultClient.Do(req)
 }
 

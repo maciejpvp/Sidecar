@@ -110,7 +110,7 @@ func newSidecarLogging(t *testing.T, svc config.Service) (*httptest.Server, *acc
 	t.Helper()
 	al := newAccessLog()
 	table := routing.NewTable([]config.Service{svc})
-	srv := httptest.NewServer(New(table, slog.New(al)))
+	srv := httptest.NewServer(NewOutbound(table, slog.New(al)))
 	t.Cleanup(srv.Close)
 	return srv, al
 }
@@ -524,7 +524,7 @@ func TestAccessLogNoRoute(t *testing.T) {
 // other, and its deadline is 0 because no service policy was ever found.
 func TestAccessLogMeshNotReady(t *testing.T) {
 	al := newAccessLog()
-	sidecar := httptest.NewServer(New(routing.NewStore(nil), slog.New(al)))
+	sidecar := httptest.NewServer(NewOutbound(routing.NewStore(nil), slog.New(al)))
 	t.Cleanup(sidecar.Close)
 
 	res := call(t, sidecar, http.MethodGet, nil)

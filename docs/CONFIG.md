@@ -16,7 +16,7 @@ out-of-range value stops startup with exit 1 and a message naming the field, and
 reported at once. Not every field is **honoured** yet, because the features they configure are still
 to come ([TODO.md](TODO.md), decision D3 in [QUESTIONS.md](QUESTIONS.md)). Honoured today:
 
-- sidecar: `listeners.outbound`, `listeners.admin`, `app.*`, `controlPlane.address`, `service.*`,
+- sidecar: `listeners.*`, `app.*`, `controlPlane.address`, `service.*`, `inbound.*`,
   `limits.maxHeaderBytes`, `shutdown.drainTimeout`, `log.level`;
 - mesh: `registry.leaseTTL`, `reload.interval`, `log.level`, and per service `timeout`,
   `retry.maxAttempts`, `retry.maxBodyBytes`.
@@ -45,7 +45,7 @@ app:
 
 # ---------------------------------------------------------------- listeners
 listeners:
-  inbound:  "0.0.0.0:15000"      # public entry, other sidecars connect here (not built yet)
+  inbound:  "0.0.0.0:15000"      # public entry, other sidecars connect here
   outbound: "127.0.0.1:15001"    # MUST be loopback, used by the local app
   admin:    "0.0.0.0:15020"      # /healthz (liveness), /readyz (has a snapshot), /snapshot
 

@@ -49,16 +49,12 @@ func main() {
 func run(cfg *config.Sidecar, log *slog.Logger) error {
 	sc := sidecar.New(cfg, log)
 
-	outboundLn, err := net.Listen("tcp", cfg.Listeners.Outbound)
+	lns, err := listenAll(cfg.Listeners.Inbound, cfg.Listeners.Outbound, cfg.Listeners.Admin)
 	if err != nil {
 		return err
 	}
-	adminLn, err := net.Listen("tcp", cfg.Listeners.Admin)
-	if err != nil {
-		outboundLn.Close()
-		return err
-	}
-	outbound, admin := sc.OutboundServer(), sc.AdminServer()
+	inboundLn, outboundLn, adminLn := lns[0], lns[1], lns[2]
+	inbound, outbound, admin := sc.InboundServer(), sc.OutboundServer(), sc.AdminServer()
 
 	stop, cancelSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancelSignals()
@@ -72,19 +68,20 @@ func run(cfg *config.Sidecar, log *slog.Logger) error {
 		close(discoveryDone)
 	}()
 
-	serveErr := make(chan error, 2)
+	serveErr := make(chan error, 3)
 	for _, s := range []struct {
 		srv *http.Server
 		ln  net.Listener
-	}{{outbound, outboundLn}, {admin, adminLn}} {
+	}{{inbound, inboundLn}, {outbound, outboundLn}, {admin, adminLn}} {
 		go func() {
 			if err := s.srv.Serve(s.ln); !errors.Is(err, http.ErrServerClosed) {
 				serveErr <- err
 			}
 		}()
 	}
-	log.Info("ready", "outbound", outboundLn.Addr().String(), "admin", adminLn.Addr().String(),
-		"controlPlane", cfg.ControlPlane.Address, "advertise", cfg.Service.Advertise)
+	log.Info("ready", "inbound", inboundLn.Addr().String(), "outbound", outboundLn.Addr().String(),
+		"admin", adminLn.Addr().String(), "controlPlane", cfg.ControlPlane.Address,
+		"advertise", cfg.Service.Advertise)
 
 	var failure error
 	select {
@@ -103,7 +100,7 @@ func run(cfg *config.Sidecar, log *slog.Logger) error {
 	ctx, cancel := context.WithTimeout(context.Background(), cfg.Shutdown.DrainTimeout)
 	defer cancel()
 	var wg sync.WaitGroup
-	for _, srv := range []*http.Server{outbound, admin} {
+	for _, srv := range []*http.Server{inbound, outbound, admin} {
 		wg.Go(func() {
 			if err := srv.Shutdown(ctx); err != nil {
 				srv.Close()
@@ -113,4 +110,21 @@ func run(cfg *config.Sidecar, log *slog.Logger) error {
 	wg.Wait()
 	log.Info("shutdown_complete")
 	return failure
+}
+
+// listenAll binds every address or none: a sidecar missing one of its listeners
+// would register itself and then refuse the traffic that follows.
+func listenAll(addrs ...string) ([]net.Listener, error) {
+	var lns []net.Listener
+	for _, addr := range addrs {
+		ln, err := net.Listen("tcp", addr)
+		if err != nil {
+			for _, open := range lns {
+				open.Close()
+			}
+			return nil, err
+		}
+		lns = append(lns, ln)
+	}
+	return lns, nil
 }

@@ -25,14 +25,14 @@ type readiness interface {
 	Ready() bool
 }
 
-type Handler struct {
+type Outbound struct {
 	routes    Resolver
 	log       *slog.Logger
 	transport http.RoundTripper
 }
 
-func New(routes Resolver, log *slog.Logger) *Handler {
-	return &Handler{
+func NewOutbound(routes Resolver, log *slog.Logger) *Outbound {
+	return &Outbound{
 		routes: routes,
 		log:    log,
 		// Owned rather than http.DefaultTransport so the connection pool is
@@ -43,7 +43,7 @@ func New(routes Resolver, log *slog.Logger) *Handler {
 
 // CloseIdleConnections drops idle pooled connections after a routing swap.
 // Connections busy at that moment linger until the transport's idle timeout.
-func (h *Handler) CloseIdleConnections() {
+func (h *Outbound) CloseIdleConnections() {
 	if t, ok := h.transport.(interface{ CloseIdleConnections() }); ok {
 		t.CloseIdleConnections()
 	}
@@ -60,7 +60,7 @@ func serviceName(r *http.Request) string {
 	return strings.ToLower(name)
 }
 
-func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+func (h *Outbound) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	name := serviceName(r)
 	rec, w := accesslog.Start(w, accesslog.Outbound, r)
 	rec.Target = name
@@ -125,7 +125,7 @@ func bufferBody(r *http.Request, limit int64) error {
 	return nil
 }
 
-func (h *Handler) reverseProxy(svc *routing.Service, log *slog.Logger, rec *accesslog.Record) *httputil.ReverseProxy {
+func (h *Outbound) reverseProxy(svc *routing.Service, log *slog.Logger, rec *accesslog.Record) *httputil.ReverseProxy {
 	return &httputil.ReverseProxy{
 		// No SetURL: the instance is chosen per attempt inside the transport.
 		Rewrite: func(pr *httputil.ProxyRequest) {

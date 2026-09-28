@@ -21,7 +21,8 @@ import (
 type Sidecar struct {
 	Config    *config.Sidecar
 	Routes    *routing.Store
-	Proxy     *proxy.Handler
+	Outbound  *proxy.Outbound
+	Inbound   *proxy.Inbound
 	Watcher   *discovery.Watcher
 	Registrar *discovery.Registrar
 }
@@ -30,18 +31,19 @@ type Sidecar struct {
 // registers itself while its app is healthy. Nothing runs until Run.
 func New(cfg *config.Sidecar, log *slog.Logger) *Sidecar {
 	routes := routing.NewStore(nil) // not ready until the first snapshot
-	p := proxy.New(routes, log)
+	out := proxy.NewOutbound(routes, log)
 	client := discovery.NewClient(cfg.ControlPlane.Address)
 
 	return &Sidecar{
-		Config: cfg,
-		Routes: routes,
-		Proxy:  p,
+		Config:   cfg,
+		Routes:   routes,
+		Outbound: out,
+		Inbound:  proxy.NewInbound(cfg.App.Address, cfg.Inbound, log),
 		Watcher: discovery.NewWatcher(client, log, func(services []config.Service) {
 			// Swap first, so no request opens a connection to a removed
 			// instance after the pool is cleared.
 			routes.Swap(routing.NewTable(services))
-			p.CloseIdleConnections()
+			out.CloseIdleConnections()
 		}),
 		Registrar: discovery.NewRegistrar(client, log, cfg.Service.Name, cfg.Service.Advertise,
 			discovery.HTTPHealth(cfg.App.Address, cfg.App.HealthPath)),
@@ -63,7 +65,17 @@ func (s *Sidecar) OutboundServer() *http.Server {
 	// No ReadTimeout/WriteTimeout: they would cap the whole exchange, fighting
 	// the per-service deadline and cutting off streaming responses.
 	return &http.Server{
-		Handler:           s.Proxy,
+		Handler:           s.Outbound,
+		ReadHeaderTimeout: 10 * time.Second,
+		MaxHeaderBytes:    s.Config.Limits.MaxHeaderBytes,
+	}
+}
+
+// InboundServer is how the rest of the mesh reaches this pod's app.
+func (s *Sidecar) InboundServer() *http.Server {
+	// No ReadTimeout/WriteTimeout, for the same reason as OutboundServer.
+	return &http.Server{
+		Handler:           s.Inbound,
 		ReadHeaderTimeout: 10 * time.Second,
 		MaxHeaderBytes:    s.Config.Limits.MaxHeaderBytes,
 	}
